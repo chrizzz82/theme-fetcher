@@ -9,7 +9,8 @@ import requests
 from pathlib import Path
 from typing import List, Optional
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
+from pydantic import BaseModel
 import xml.etree.ElementTree as ET
 
 app = FastAPI(title="Theme Fetcher")
@@ -45,6 +46,7 @@ EXCLUDE_KEYWORDS = [
 state_lock = threading.Lock()
 is_scanning = False
 scan_status_msg = ""
+scan_details_log = []
 
 
 def load_config() -> dict:
@@ -119,17 +121,15 @@ def scan_local_folders(paths_str: str) -> List[dict]:
     for base_str in paths:
         base = Path(base_str)
         if not base.exists() or not base.is_dir():
+            print(f"[Lokaler Scan] Pfad existiert nicht oder ist kein Ordner: {base_str}")
             continue
 
         try:
-            # Check 1 to 2 levels deep
             for root, dirs, files in os.walk(base):
                 rpath = Path(root)
-                # Ignore system / internal folders
-                if rpath.name.startswith(".") or rpath.name.lower() in ("@eaDir", "$recycle.bin", "system volume information"):
+                if rpath.name.startswith(".") or rpath.name.lower() in ("@eadir", "$recycle.bin", "system volume information"):
                     continue
 
-                # Don't go excessively deep
                 try:
                     rel_parts = rpath.relative_to(base).parts
                 except ValueError:
@@ -137,17 +137,14 @@ def scan_local_folders(paths_str: str) -> List[dict]:
                 if len(rel_parts) > 3:
                     continue
 
-                # Check if this folder has video files or theme.mp3 or season folders
                 has_video = any(Path(f).suffix.lower() in video_exts for f in files)
                 has_theme = (rpath / "theme.mp3").exists()
                 has_seasons = any(re.search(r"season|staffel|specials", d, re.IGNORECASE) for d in dirs)
 
                 if has_video or has_theme or has_seasons:
-                    # Skip Season/Staffel subfolders itself
-                    if re.search(r"^(season|staffel|specials|\bS\d+)", rpath.name, re.IGNORECASE):
+                    if re.search(r"^(season|staffel|specials|\bs\d+)", rpath.name, re.IGNORECASE):
                         continue
 
-                    # Extract title & year from folder name e.g. "Matrix (1999)"
                     name = rpath.name
                     year = None
                     m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", name)
@@ -157,7 +154,6 @@ def scan_local_folders(paths_str: str) -> List[dict]:
                     else:
                         title = re.sub(r"[\._]", " ", name).strip()
 
-                    # Determine type
                     itype = "Serie" if has_seasons or any("s01" in f.lower() or "staffel" in f.lower() for f in files) else "Film"
                     item_id = f"local_{abs(hash(str(rpath)))}"
 
@@ -176,10 +172,109 @@ def scan_local_folders(paths_str: str) -> List[dict]:
     return results
 
 
+def test_jellyfin_connection(url: str, api_key: str) -> dict:
+    url = url.strip().rstrip("/")
+    api_key = api_key.strip()
+    if not url:
+        return {"ok": False, "msg": "Bitte zuerst eine Server-URL eintragen (z. B. http://192.168.178.X:8096)"}
+    if not api_key:
+        return {"ok": False, "msg": "Bitte einen API-Key eintragen"}
+
+    headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+    try:
+        # Test 1: System Info
+        sys_resp = requests.get(f"{url}/System/Info", headers=headers, timeout=6)
+        server_name = "Jellyfin"
+        version = ""
+        if sys_resp.status_code == 200:
+            s_data = sys_resp.json()
+            server_name = s_data.get("ServerName", "Jellyfin")
+            version = s_data.get("Version", "")
+
+        # Test 2: Users check API key validity
+        users_resp = requests.get(f"{url}/Users", headers=headers, timeout=6)
+        if users_resp.status_code == 401 or users_resp.status_code == 403:
+            return {"ok": False, "msg": f"URL erreichbar, aber API-Key ungültig (HTTP {users_resp.status_code})"}
+        users_resp.raise_for_status()
+        users = users_resp.json()
+
+        # Test 3: Count items
+        user_id = users[0]["Id"] if users else None
+        item_count = 0
+        if user_id:
+            it_resp = requests.get(
+                f"{url}/Users/{user_id}/Items",
+                headers=headers,
+                params={"IncludeItemTypes": "Movie,Series,BoxSet", "Recursive": "true", "Limit": "1"},
+                timeout=6
+            )
+            if it_resp.status_code == 200:
+                item_count = it_resp.json().get("TotalRecordCount", 0)
+
+        info_txt = f"Verbunden mit '{server_name}' (v{version}) • {len(users)} Benutzer • {item_count} Medien gefunden!"
+        return {"ok": True, "msg": info_txt}
+    except requests.exceptions.ConnectTimeout:
+        return {"ok": False, "msg": "Zeitüberschreitung (Timeout). Läuft Jellyfin unter dieser IP und diesem Port?"}
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "msg": f"Verbindung abgelehnt (Connection Refused). Falls 'localhost'/'127.0.0.1' eingetragen ist: Bitte die echte ZimaOS-IP (z. B. http://192.168.178.X:8096) verwenden!"}
+    except Exception as e:
+        return {"ok": False, "msg": f"Fehler: {str(e)}"}
+
+
+def test_plex_connection(url: str, token: str) -> dict:
+    url = url.strip().rstrip("/")
+    token = token.strip()
+    if not url:
+        return {"ok": False, "msg": "Bitte Plex Server-URL eintragen"}
+    if not token:
+        return {"ok": False, "msg": "Bitte Plex Token eintragen"}
+
+    headers = {"X-Plex-Token": token, "Accept": "application/json"}
+    try:
+        resp = requests.get(f"{url}/", headers=headers, timeout=6)
+        if resp.status_code in (401, 403):
+            return {"ok": False, "msg": "URL erreichbar, aber Plex Token ist ungültig!"}
+        resp.raise_for_status()
+        data = resp.json().get("MediaContainer", {})
+        friendly_name = data.get("friendlyName", "Plex Server")
+        version = data.get("version", "")
+        return {"ok": True, "msg": f"Verbunden mit '{friendly_name}' (v{version})!"}
+    except Exception as e:
+        return {"ok": False, "msg": f"Plex Fehler: {str(e)}"}
+
+
+def test_folder_path(paths_str: str) -> dict:
+    paths_str = paths_str.strip()
+    if not paths_str:
+        return {"ok": False, "msg": "Kein Pfad angegeben"}
+
+    paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
+    details = []
+    total_found = 0
+
+    for p in paths:
+        path_obj = Path(p)
+        if not path_obj.exists():
+            details.append(f"❌ '{p}' existiert nicht im Container (Mount in Docker Compose prüfen!)")
+        elif not path_obj.is_dir():
+            details.append(f"❌ '{p}' ist kein Verzeichnis")
+        else:
+            try:
+                subdirs = [d.name for d in path_obj.iterdir() if d.is_dir() and not d.name.startswith(".")]
+                files = [f.name for f in path_obj.iterdir() if f.is_file()]
+                details.append(f"✓ '{p}': {len(subdirs)} Unterordner, {len(files)} Dateien im Hauptverzeichnis")
+                total_found += len(subdirs)
+            except Exception as e:
+                details.append(f"⚠️ '{p}' Lesefehler: {e}")
+
+    ok = any("✓" in d for d in details)
+    return {"ok": ok, "msg": " | ".join(details)}
+
+
 def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
     if not url or not api_key:
         return []
-    headers = {"X-Emby-Token": api_key}
+    headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
     results = []
     try:
         users_resp = requests.get(f"{url}/Users", headers=headers, timeout=10)
@@ -194,7 +289,7 @@ def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
             "Recursive": "true",
             "Fields": "Path,ProductionYear,OriginalTitle"
         }
-        resp = requests.get(f"{url}/Users/{user_id}/Items", headers=headers, params=params, timeout=20)
+        resp = requests.get(f"{url}/Users/{user_id}/Items", headers=headers, params=params, timeout=25)
         resp.raise_for_status()
 
         for item in resp.json().get("Items", []):
@@ -231,7 +326,7 @@ def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
                 "dir": str(target_dir)
             })
     except Exception as e:
-        print(f"[Jellyfin Fehler] {e}")
+        print(f"[Jellyfin Fetch Fehler] {e}")
     return results
 
 
@@ -437,21 +532,38 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
 
 def run_full_scan():
-    global is_scanning, scan_status_msg
+    global is_scanning, scan_status_msg, scan_details_log
     if is_scanning:
         return
     is_scanning = True
     scan_status_msg = "Scan läuft..."
+    scan_details_log = []
     try:
         cfg = load_config()
         state = load_state()
 
         raw_items = []
-        if cfg.get("local_scan_enabled", True):
-            raw_items.extend(scan_local_folders(cfg.get("local_media_paths", "/media")))
+        loc_count = 0
+        jf_count = 0
+        plex_count = 0
 
-        raw_items.extend(fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", "")))
-        raw_items.extend(fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", "")))
+        if cfg.get("local_scan_enabled", True):
+            loc_items = scan_local_folders(cfg.get("local_media_paths", "/media"))
+            loc_count = len(loc_items)
+            raw_items.extend(loc_items)
+            scan_details_log.append(f"📁 Lokaler Ordner: {loc_count} Einträge gefunden")
+
+        if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
+            jf_items = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""))
+            jf_count = len(jf_items)
+            raw_items.extend(jf_items)
+            scan_details_log.append(f"🎬 Jellyfin: {jf_count} Einträge gefunden")
+
+        if cfg.get("plex_url") and cfg.get("plex_token"):
+            plex_items = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""))
+            plex_count = len(plex_items)
+            raw_items.extend(plex_items)
+            scan_details_log.append(f"🍿 Plex: {plex_count} Einträge gefunden")
 
         by_dir = {}
         for it in raw_items:
@@ -461,6 +573,7 @@ def run_full_scan():
         auto_dl = cfg.get("auto_download", True)
         jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
+        download_count = 0
         for dir_path, it in by_dir.items():
             item_id = it["id"]
             existing = state["items"].get(item_id, {})
@@ -486,14 +599,17 @@ def run_full_scan():
                     record["video_id"] = dl_res["video_id"]
                     record["video_title"] = dl_res["video_title"]
                     record["status"] = "Heruntergeladen"
+                    download_count += 1
                 else:
                     record["status"] = dl_res["msg"]
 
             state["items"][item_id] = record
             save_state(state)
-        scan_status_msg = f"Fertig ({len(by_dir)} Medien erkannt)"
+
+        scan_status_msg = f"Fertig ({len(by_dir)} Medien erkannt" + (f", {download_count} neu geladen)" if download_count else ")")
     except Exception as e:
         scan_status_msg = f"Fehler: {e}"
+        scan_details_log.append(f"❌ Fehler: {e}")
         print(f"[Scan Fehler] {e}")
     finally:
         is_scanning = False
@@ -528,6 +644,31 @@ def stream_audio(item_id: str):
 def trigger_scan():
     threading.Thread(target=run_full_scan, daemon=True).start()
     return RedirectResponse("/", status_code=303)
+
+
+# TEST API ENDPOINTS
+class TestJellyfinReq(BaseModel):
+    url: str
+    api_key: str
+
+class TestPlexReq(BaseModel):
+    url: str
+    token: str
+
+class TestFolderReq(BaseModel):
+    paths: str
+
+@app.post("/api/test-jellyfin")
+def api_test_jellyfin(data: TestJellyfinReq):
+    return test_jellyfin_connection(data.url, data.api_key)
+
+@app.post("/api/test-plex")
+def api_test_plex(data: TestPlexReq):
+    return test_plex_connection(data.url, data.token)
+
+@app.post("/api/test-folder")
+def api_test_folder(data: TestFolderReq):
+    return test_folder_path(data.paths)
 
 
 @app.post("/settings")
@@ -670,6 +811,9 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
 
     saved_banner = '<div class="banner">✓ Einstellungen gespeichert & Scan gestartet!</div>' if settings == "saved" else ""
     scan_info = f" • ⏳ {scan_status_msg}" if is_scanning else (f" • {scan_status_msg}" if scan_status_msg else "")
+    details_html = ""
+    if scan_details_log:
+        details_html = "<div style='font-size:0.85rem; color:#8b929a; margin-top:6px;'>" + " • ".join(scan_details_log) + "</div>"
 
     return f"""
     <!doctype html>
@@ -702,6 +846,8 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             button:hover, .btn:hover {{ background: var(--primary-hover); }}
             button.secondary {{ background: #2a2e36; color: var(--text); }}
             button.secondary:hover {{ background: #353b45; }}
+            button.test {{ background: #2f3e54; color: #7db2ff; border: 1px solid #415575; font-size: 0.8rem; padding: 6px 12px; }}
+            button.test:hover {{ background: #3a4d69; }}
             button.danger {{ background: var(--danger); padding: 8px 10px; }}
             input[type="text"], input[type="number"], select {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; }}
             input[type="text"]:focus, select:focus {{ outline: none; border-color: var(--primary); }}
@@ -716,14 +862,16 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             audio {{ height: 32px; width: 220px; }}
             .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
             
-            /* Modal / Settings Panel */
             .settings-panel {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
             .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
             .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
             .form-group label {{ font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }}
             .checkbox-group {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
             .checkbox-group input {{ width: 18px; height: 18px; cursor: pointer; }}
-            .section-title {{ font-size: 1rem; font-weight: 700; margin-top: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
+            .section-title {{ font-size: 1rem; font-weight: 700; margin-top: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; display:flex; justify-content:space-between; align-items:center; }}
+            .test-result {{ margin-top: 6px; font-size: 0.85rem; padding: 6px 10px; border-radius: 4px; display: none; }}
+            .test-result.ok {{ display: block; background: #133824; color: #5ce69a; border: 1px solid #1f5938; }}
+            .test-result.err {{ display: block; background: #421c1c; color: #ff8585; border: 1px solid #6b2d2d; }}
         </style>
     </head>
     <body>
@@ -731,6 +879,7 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             <div>
                 <h1>🎵 Theme Fetcher</h1>
                 <div class="stats">{present} von {total} Themes vorhanden ({col_count} Collections){scan_info}</div>
+                {details_html}
             </div>
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
@@ -746,12 +895,18 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
         <div id="settingsBox" class="settings-panel" style="display: {'block' if settings == 'open' else 'none'};">
             <h2 style="margin: 0 0 10px 0; font-size: 1.2rem;">⚙️ Einstellungen & Quellen</h2>
             <form method="post" action="/settings">
-                <div class="section-title">📁 1. Lokale Medienquellen (Festplatte)</div>
+                
+                <!-- 1. LOKALE MEDIEN -->
+                <div class="section-title">
+                    <span>📁 1. Lokale Medienquellen (Festplatte)</span>
+                    <button type="button" class="test" onclick="runTestFolder()">📂 Ordnerpfad testen</button>
+                </div>
                 <div class="settings-grid">
                     <div class="form-group" style="grid-column: 1 / -1;">
                         <label>Medienpfad(e) im Container</label>
-                        <input type="text" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media oder /media/ZimaOS-HDD">
-                        <small style="color:var(--text-muted);">Standard ist <code>/media</code>. Mehrere Pfade können mit Komma getrennt werden.</small>
+                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media oder /media/ZimaOS-HDD">
+                        <small style="color:var(--text-muted);">Standard ist <code>/media</code>. Entspricht dem Pfad, den du in Docker Compose unter volumes gemountet hast.</small>
+                        <div id="res_folder" class="test-result"></div>
                     </div>
                     <div class="checkbox-group">
                         <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
@@ -759,26 +914,38 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
                     </div>
                 </div>
 
-                <div class="section-title" style="margin-top:20px;">🎬 2. Medienserver (Optional)</div>
+                <!-- 2. JELLYFIN & PLEX -->
+                <div class="section-title" style="margin-top:20px;">
+                    <span>🎬 2. Medienserver (Jellyfin / Plex)</span>
+                    <div style="display:flex; gap:6px;">
+                        <button type="button" class="test" onclick="runTestJellyfin()">🔌 Jellyfin testen</button>
+                        <button type="button" class="test" onclick="runTestPlex()">🍿 Plex testen</button>
+                    </div>
+                </div>
                 <div class="settings-grid">
                     <div class="form-group">
                         <label>Jellyfin Server-URL</label>
-                        <input type="text" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}" placeholder="http://192.168.178.X:8096">
+                        <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}" placeholder="http://192.168.178.X:8096">
+                        <small style="color:var(--text-muted);">Wichtig: Die echte IP deines ZimaOS (nicht localhost/127.0.0.1)</small>
                     </div>
                     <div class="form-group">
                         <label>Jellyfin API-Key</label>
-                        <input type="text" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="API-Key aus Jellyfin">
+                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="In Jellyfin unter Dashboard > Erweitert > API-Schlüssel">
+                    </div>
+                    <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
+
+                    <div class="form-group">
+                        <label>Plex Server-URL (Optional)</label>
+                        <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}" placeholder="http://192.168.178.X:32400">
                     </div>
                     <div class="form-group">
-                        <label>Plex Server-URL</label>
-                        <input type="text" name="plex_url" value="{cfg.get('plex_url', '')}" placeholder="http://192.168.178.X:32400">
+                        <label>Plex Token (Optional)</label>
+                        <input type="text" id="cfg_plex_token" name="plex_token" value="{cfg.get('plex_token', '')}" placeholder="X-Plex-Token">
                     </div>
-                    <div class="form-group">
-                        <label>Plex Token</label>
-                        <input type="text" name="plex_token" value="{cfg.get('plex_token', '')}" placeholder="X-Plex-Token">
-                    </div>
+                    <div id="res_plex" class="test-result" style="grid-column: 1 / -1;"></div>
                 </div>
 
+                <!-- 3. DOWNLOAD & AUTOMATION -->
                 <div class="section-title" style="margin-top:20px;">⚡ 3. Download & Automatisierung</div>
                 <div class="settings-grid">
                     <div class="checkbox-group">
@@ -832,13 +999,84 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
                     <th>Aktion (Nächster Treffer / Suchbegriff / URL)</th>
                 </tr>
             </thead>
-            <tbody>{rows or '<tr><td colspan="4" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge gefunden. Klicke oben auf ⚙️ Einstellungen, um deinen Medienordner anzugeben.</td></tr>'}</tbody>
+            <tbody>{rows or '<tr><td colspan="4" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge gefunden. Klicke oben auf ⚙️ Einstellungen, teste die Verbindung zu Jellyfin oder überprüfe den Ordnerpfad.</td></tr>'}</tbody>
         </table>
 
         <script>
             function toggleSettings() {{
                 const el = document.getElementById('settingsBox');
                 el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
+            }}
+
+            async function runTestJellyfin() {{
+                const resEl = document.getElementById('res_jf');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Verbindung zu Jellyfin...';
+                
+                const url = document.getElementById('cfg_jf_url').value;
+                const apiKey = document.getElementById('cfg_jf_key').value;
+
+                try {{
+                    const resp = await fetch('/api/test-jellyfin', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, api_key: apiKey }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
+                }}
+            }}
+
+            async function runTestPlex() {{
+                const resEl = document.getElementById('res_plex');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Verbindung zu Plex...';
+                
+                const url = document.getElementById('cfg_plex_url').value;
+                const token = document.getElementById('cfg_plex_token').value;
+
+                try {{
+                    const resp = await fetch('/api/test-plex', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, token: token }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
+                }}
+            }}
+
+            async function runTestFolder() {{
+                const resEl = document.getElementById('res_folder');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Medienpfad im Container...';
+                
+                const paths = document.getElementById('cfg_paths').value;
+
+                try {{
+                    const resp = await fetch('/api/test-folder', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ paths: paths }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
+                }}
             }}
         </script>
     </body>
