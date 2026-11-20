@@ -44,9 +44,19 @@ EXCLUDE_KEYWORDS = [
 ]
 
 state_lock = threading.Lock()
-is_scanning = False
-scan_status_msg = ""
-scan_details_log = []
+
+# PROGRESS & SCAN STATE
+scan_progress = {
+    "is_running": False,
+    "current_step": "Bereit",
+    "current_item": "",
+    "processed": 0,
+    "total": 0,
+    "percent": 0,
+    "new_downloaded": 0,
+    "failed": 0,
+    "folders_scanned": []
+}
 
 
 def load_config() -> dict:
@@ -71,7 +81,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"items": {}, "blacklist": {}}
+    return {"items": {}, "blacklist": {}, "folders": []}
 
 
 def save_state(state: dict):
@@ -110,10 +120,45 @@ def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
             print(f"[Collection Sync Warnung] {e}")
 
 
-def scan_local_folders(paths_str: str) -> List[dict]:
+def resolve_media_path(raw_path_str: str) -> Path:
+    raw_str = raw_path_str.replace("\\", "/")
+    p = Path(raw_str)
+    if p.exists():
+        return p
+
+    # Remove root slash parts
+    parts = [part for part in p.parts if part not in ("/", "\\", "")]
+    
+    # 1. Try directly mapping under /media: /Film/... -> /media/Film/...
+    cand1 = Path("/media", *parts)
+    if cand1.exists() or cand1.parent.exists():
+        return cand1
+
+    # 2. Try stripping the first top-level folder if it matches common mount names (e.g. /Film/... -> /media/...)
+    if len(parts) > 1:
+        cand2 = Path("/media", *parts[1:])
+        if cand2.exists() or cand2.parent.exists():
+            return cand2
+
+    # 3. Check for keywords
+    for i, part in enumerate(parts):
+        if part.lower() in ("media", "data", "movies", "filme", "film", "serien", "series", "shows"):
+            candidate = Path("/media", *parts[i:])
+            if candidate.exists() or candidate.parent.exists():
+                return candidate
+            candidate_inner = Path("/media", *parts[i+1:])
+            if candidate_inner.exists() or candidate_inner.parent.exists():
+                return candidate_inner
+
+    # 4. If all fails, map cleanly under /media
+    return cand1
+
+
+def scan_local_folders(paths_str: str) -> tuple[List[dict], List[str]]:
     results = []
+    scanned_dirs = []
     if not paths_str:
-        return results
+        return results, scanned_dirs
 
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
@@ -121,9 +166,10 @@ def scan_local_folders(paths_str: str) -> List[dict]:
     for base_str in paths:
         base = Path(base_str)
         if not base.exists() or not base.is_dir():
-            print(f"[Lokaler Scan] Pfad existiert nicht oder ist kein Ordner: {base_str}")
+            scanned_dirs.append(f"❌ {base_str} (Pfad existiert nicht im Container)")
             continue
 
+        scanned_dirs.append(f"📁 {base_str} (Aktiv)")
         try:
             for root, dirs, files in os.walk(base):
                 rpath = Path(root)
@@ -169,7 +215,7 @@ def scan_local_folders(paths_str: str) -> List[dict]:
         except Exception as e:
             print(f"[Lokaler Scan Fehler bei {base_str}] {e}")
 
-    return results
+    return results, scanned_dirs
 
 
 def get_jellyfin_headers(api_key: str) -> dict:
@@ -177,9 +223,10 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f"MediaBrowser Token=\"{clean_key}\", Client=\"ThemeFetcher\", Device=\"ZimaOS\", DeviceId=\"theme-fetcher-zimaos\", Version=\"1.0.0\"",
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.0.0"',
         "Accept": "application/json"
     }
+
 
 def test_jellyfin_connection(url: str, api_key: str) -> dict:
     url = url.strip().rstrip("/")
@@ -191,7 +238,6 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
 
     headers = get_jellyfin_headers(api_key)
     try:
-        # Test 1: System Info
         sys_resp = requests.get(f"{url}/System/Info", headers=headers, timeout=6)
         server_name = "Jellyfin"
         version = ""
@@ -200,21 +246,19 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
             server_name = s_data.get("ServerName", "Jellyfin")
             version = s_data.get("Version", "")
 
-        # Test 2: Users check API key validity
         users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key}, timeout=6)
-        if users_resp.status_code == 401 or users_resp.status_code == 403:
+        if users_resp.status_code in (401, 403):
             return {"ok": False, "msg": f"URL erreichbar, aber API-Key ungültig (HTTP {users_resp.status_code})"}
         users_resp.raise_for_status()
         users = users_resp.json()
 
-        # Test 3: Count items
         user_id = users[0]["Id"] if users else None
         item_count = 0
         if user_id:
             it_resp = requests.get(
                 f"{url}/Users/{user_id}/Items",
                 headers=headers,
-                params={"IncludeItemTypes": "Movie,Series,BoxSet", "Recursive": "true", "Limit": "1"},
+                params={"IncludeItemTypes": "Movie,Series,BoxSet", "Recursive": "true", "Limit": "1", "api_key": api_key},
                 timeout=6
             )
             if it_resp.status_code == 200:
@@ -225,7 +269,7 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
     except requests.exceptions.ConnectTimeout:
         return {"ok": False, "msg": "Zeitüberschreitung (Timeout). Läuft Jellyfin unter dieser IP und diesem Port?"}
     except requests.exceptions.ConnectionError:
-        return {"ok": False, "msg": f"Verbindung abgelehnt (Connection Refused). Falls 'localhost'/'127.0.0.1' eingetragen ist: Bitte die echte ZimaOS-IP (z. B. http://192.168.178.X:8096) verwenden!"}
+        return {"ok": False, "msg": "Verbindung abgelehnt. Falls 'localhost'/'127.0.0.1' eingetragen ist: Bitte die echte ZimaOS-IP (z. B. http://192.168.178.X:8096) verwenden!"}
     except Exception as e:
         return {"ok": False, "msg": f"Fehler: {str(e)}"}
 
@@ -259,7 +303,6 @@ def test_folder_path(paths_str: str) -> dict:
 
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     details = []
-    total_found = 0
 
     for p in paths:
         path_obj = Path(p)
@@ -271,8 +314,7 @@ def test_folder_path(paths_str: str) -> dict:
             try:
                 subdirs = [d.name for d in path_obj.iterdir() if d.is_dir() and not d.name.startswith(".")]
                 files = [f.name for f in path_obj.iterdir() if f.is_file()]
-                details.append(f"✓ '{p}': {len(subdirs)} Unterordner, {len(files)} Dateien im Hauptverzeichnis")
-                total_found += len(subdirs)
+                details.append(f"✓ '{p}': {len(subdirs)} Unterordner, {len(files)} Dateien")
             except Exception as e:
                 details.append(f"⚠️ '{p}' Lesefehler: {e}")
 
@@ -280,27 +322,30 @@ def test_folder_path(paths_str: str) -> dict:
     return {"ok": ok, "msg": " | ".join(details)}
 
 
-def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
+def fetch_jellyfin_items(url: str, api_key: str) -> tuple[List[dict], List[str]]:
     if not url or not api_key:
-        return []
+        return [], []
     headers = get_jellyfin_headers(api_key)
     results = []
+    scanned_folders = []
     try:
         users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key.strip()}, timeout=10)
         users_resp.raise_for_status()
         users = users_resp.json()
         if not users:
-            return []
+            return [], []
         user_id = users[0]["Id"]
 
         params = {
             "IncludeItemTypes": "Movie,Series,BoxSet",
             "Recursive": "true",
-            "Fields": "Path,ProductionYear,OriginalTitle"
+            "Fields": "Path,ProductionYear,OriginalTitle",
+            "api_key": api_key.strip()
         }
         resp = requests.get(f"{url}/Users/{user_id}/Items", headers=headers, params=params, timeout=25)
         resp.raise_for_status()
 
+        seen_dirs = set()
         for item in resp.json().get("Items", []):
             item_type = item.get("Type")
             title = item.get("Name", "Unbekannt")
@@ -323,8 +368,14 @@ def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
             raw_path = item.get("Path")
             if not raw_path:
                 continue
-            p = Path(raw_path)
-            target_dir = p.parent if item_type == "Movie" else p
+            resolved = resolve_media_path(raw_path)
+            target_dir = resolved.parent if item_type == "Movie" else resolved
+
+            parent_folder = str(target_dir.parent)
+            if parent_folder not in seen_dirs:
+                seen_dirs.add(parent_folder)
+                scanned_folders.append(f"🎬 Jellyfin Pfad: {parent_folder}")
+
             results.append({
                 "id": item_id,
                 "source": "Jellyfin",
@@ -336,14 +387,15 @@ def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
             })
     except Exception as e:
         print(f"[Jellyfin Fetch Fehler] {e}")
-    return results
+    return results, scanned_folders
 
 
-def fetch_plex_items(url: str, token: str) -> List[dict]:
+def fetch_plex_items(url: str, token: str) -> tuple[List[dict], List[str]]:
     if not url or not token:
-        return []
+        return [], []
     headers = {"X-Plex-Token": token, "Accept": "application/xml"}
     results = []
+    scanned_folders = []
     try:
         sec_resp = requests.get(f"{url}/library/sections", headers=headers, timeout=10)
         sec_resp.raise_for_status()
@@ -352,9 +404,11 @@ def fetch_plex_items(url: str, token: str) -> List[dict]:
         for directory in root.findall("Directory"):
             sec_id = directory.attrib.get("key")
             sec_type = directory.attrib.get("type")
+            sec_title = directory.attrib.get("title", "Mediathek")
             if sec_type not in ("movie", "show"):
                 continue
 
+            scanned_folders.append(f"🍿 Plex Sektion: {sec_title} ({sec_type})")
             items_resp = requests.get(f"{url}/library/sections/{sec_id}/all", headers=headers, timeout=20)
             items_root = ET.fromstring(items_resp.text)
 
@@ -362,7 +416,8 @@ def fetch_plex_items(url: str, token: str) -> List[dict]:
                 for video in items_root.findall("Video"):
                     part = video.find(".//Part")
                     if part is not None and "file" in part.attrib:
-                        p = Path(part.attrib["file"]).parent
+                        resolved = resolve_media_path(part.attrib["file"])
+                        p = resolved.parent
                         results.append({
                             "id": f"plex_{video.attrib.get('ratingKey')}",
                             "source": "Plex",
@@ -376,6 +431,7 @@ def fetch_plex_items(url: str, token: str) -> List[dict]:
                 for show in items_root.findall("Directory"):
                     loc = show.find("Location")
                     if loc is not None and "path" in loc.attrib:
+                        resolved = resolve_media_path(loc.attrib["path"])
                         results.append({
                             "id": f"plex_{show.attrib.get('ratingKey')}",
                             "source": "Plex",
@@ -383,7 +439,7 @@ def fetch_plex_items(url: str, token: str) -> List[dict]:
                             "title": show.attrib.get("title", "Unbekannt"),
                             "original_title": show.attrib.get("originalTitle", ""),
                             "year": show.attrib.get("year"),
-                            "dir": loc.attrib["path"]
+                            "dir": str(resolved)
                         })
 
             try:
@@ -409,7 +465,7 @@ def fetch_plex_items(url: str, token: str) -> List[dict]:
 
     except Exception as e:
         print(f"[Plex Fehler] {e}")
-    return results
+    return results, scanned_folders
 
 
 def build_search_queries(item: dict) -> List[str]:
@@ -443,7 +499,7 @@ def build_search_queries(item: dict) -> List[str]:
     return queries
 
 
-def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> Optional[dict]:
+def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> tuple[Optional[dict], str]:
     cmd = [
         "yt-dlp",
         search_expr,
@@ -453,10 +509,17 @@ def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> Opti
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        for line in res.stdout.strip().splitlines():
+        lines = res.stdout.strip().splitlines()
+        if not lines:
+            return None, "Keine Suchergebnisse gefunden"
+
+        for line in lines:
             if not line:
                 continue
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
             vid_id = entry.get("id", "")
             vid_title = entry.get("title", "")
             duration = entry.get("duration") or 0
@@ -472,16 +535,30 @@ def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> Opti
             if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
                 continue
 
-            return {"id": vid_id or url, "url": url, "title": vid_title}
+            return {"id": vid_id or url, "url": url, "title": vid_title}, "OK"
+        return None, "Gefundene Treffer überschreiten max. Dauer oder enthalten Ausschluss-Wörter"
+    except subprocess.TimeoutExpired:
+        return None, "Such-Timeout (YouTube antwortet verzögert)"
     except Exception as e:
-        print(f"[Such-Kandidat Fehler] {e}")
-    return None
+        return None, f"Suchfehler: {str(e)}"
 
 
 def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata") -> dict:
     blacklist = blacklist or []
     target_dir = Path(item["dir"])
-    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Test write permissions in target directory
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        test_write = target_dir / ".theme_test_write"
+        test_write.write_text("ok")
+        test_write.unlink()
+    except Exception as e:
+        # Fallback to local data cache if folder path is not writable
+        safe_fallback = DATA_DIR / "local_themes" / item["id"]
+        safe_fallback.mkdir(parents=True, exist_ok=True)
+        target_dir = safe_fallback
+        item["dir"] = str(safe_fallback)
 
     output_mp3 = target_dir / "theme.mp3"
     temp_template = str(target_dir / "theme_temp.%(ext)s")
@@ -494,6 +571,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
     )
 
     chosen_video = None
+    search_reason = ""
 
     if is_direct_url:
         chosen_video = {"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url}
@@ -505,14 +583,17 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         )
         try:
             for expr in search_list:
-                chosen_video = find_candidate(expr, blacklist, max_dur)
-                if chosen_video:
+                cand, reason = find_candidate(expr, blacklist, max_dur)
+                if cand:
+                    chosen_video = cand
                     break
+                else:
+                    search_reason = reason
         except Exception as e:
             return {"ok": False, "msg": f"Suchfehler: {e}"}
 
     if not chosen_video:
-        return {"ok": False, "msg": "Kein passender Treffer"}
+        return {"ok": False, "msg": f"Kein Treffer: {search_reason or 'Suche erfolglos'}"}
 
     try:
         dl_cmd = [
@@ -520,10 +601,15 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             "-x",
             "--audio-format", "mp3",
             "--audio-quality", "192K",
+            "--no-playlist",
             "-o", temp_template,
             chosen_video["url"]
         ]
-        subprocess.run(dl_cmd, check=True, capture_output=True, text=True, timeout=90)
+        res = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
+        if res.returncode != 0:
+            err_msg = res.stderr.strip().splitlines()[-1] if res.stderr else "Fehlercode 1"
+            return {"ok": False, "msg": f"Downloadfehler ({err_msg[:80]})"}
+
         downloaded = target_dir / "theme_temp.mp3"
         if downloaded.exists():
             if output_mp3.exists():
@@ -537,56 +623,72 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             }
         return {"ok": False, "msg": "MP3-Konvertierung fehlgeschlagen"}
     except Exception as e:
-        return {"ok": False, "msg": f"Downloadfehler: {e}"}
+        return {"ok": False, "msg": f"Downloadfehler: {str(e)[:60]}"}
 
 
 def run_full_scan():
-    global is_scanning, scan_status_msg, scan_details_log
-    if is_scanning:
+    global scan_progress
+    if scan_progress["is_running"]:
         return
-    is_scanning = True
-    scan_status_msg = "Scan läuft..."
-    scan_details_log = []
+
+    scan_progress["is_running"] = True
+    scan_progress["current_step"] = "Lese Mediatheken aus..."
+    scan_progress["processed"] = 0
+    scan_progress["total"] = 0
+    scan_progress["percent"] = 0
+    scan_progress["new_downloaded"] = 0
+    scan_progress["failed"] = 0
+    scan_progress["folders_scanned"] = []
+
     try:
         cfg = load_config()
         state = load_state()
 
         raw_items = []
-        loc_count = 0
-        jf_count = 0
-        plex_count = 0
+        all_scanned_folders = []
 
         if cfg.get("local_scan_enabled", True):
-            loc_items = scan_local_folders(cfg.get("local_media_paths", "/media"))
-            loc_count = len(loc_items)
+            loc_items, loc_folders = scan_local_folders(cfg.get("local_media_paths", "/media"))
             raw_items.extend(loc_items)
-            scan_details_log.append(f"📁 Lokaler Ordner: {loc_count} Einträge gefunden")
+            all_scanned_folders.extend(loc_folders)
 
         if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
-            jf_items = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""))
-            jf_count = len(jf_items)
+            scan_progress["current_step"] = "Lese Jellyfin Mediathek ein..."
+            jf_items, jf_folders = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""))
             raw_items.extend(jf_items)
-            scan_details_log.append(f"🎬 Jellyfin: {jf_count} Einträge gefunden")
+            all_scanned_folders.extend(jf_folders)
 
         if cfg.get("plex_url") and cfg.get("plex_token"):
-            plex_items = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""))
-            plex_count = len(plex_items)
+            scan_progress["current_step"] = "Lese Plex Mediathek ein..."
+            plex_items, plex_folders = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""))
             raw_items.extend(plex_items)
-            scan_details_log.append(f"🍿 Plex: {plex_count} Einträge gefunden")
+            all_scanned_folders.extend(plex_folders)
 
         by_dir = {}
         for it in raw_items:
             by_dir[it["dir"]] = it
 
+        scan_progress["folders_scanned"] = all_scanned_folders
+        state["folders"] = all_scanned_folders
+
+        total_items = len(by_dir)
+        scan_progress["total"] = total_items
+
         max_dur = cfg.get("max_duration_sec", 270)
         auto_dl = cfg.get("auto_download", True)
         jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
-        download_count = 0
-        for dir_path, it in by_dir.items():
+        items_list = list(by_dir.values())
+
+        for idx, it in enumerate(items_list, 1):
             item_id = it["id"]
+            title = it["title"]
+            scan_progress["processed"] = idx
+            scan_progress["percent"] = int((idx / max(1, total_items)) * 100)
+            scan_progress["current_item"] = f"{title} ({it.get('type')})"
+
             existing = state["items"].get(item_id, {})
-            mp3_path = Path(dir_path) / "theme.mp3"
+            mp3_path = Path(it["dir"]) / "theme.mp3"
             theme_exists = mp3_path.exists()
 
             if theme_exists and it.get("type") == "Collection":
@@ -601,6 +703,7 @@ def run_full_scan():
             }
 
             if auto_dl and not theme_exists:
+                scan_progress["current_step"] = f"Suche & lade: {title}..."
                 bl = state["blacklist"].get(item_id, [])
                 dl_res = search_and_download(it, blacklist=bl, max_dur=max_dur, jf_meta_base=jf_meta)
                 if dl_res["ok"]:
@@ -608,20 +711,20 @@ def run_full_scan():
                     record["video_id"] = dl_res["video_id"]
                     record["video_title"] = dl_res["video_title"]
                     record["status"] = "Heruntergeladen"
-                    download_count += 1
+                    scan_progress["new_downloaded"] += 1
                 else:
                     record["status"] = dl_res["msg"]
+                    scan_progress["failed"] += 1
 
             state["items"][item_id] = record
             save_state(state)
 
-        scan_status_msg = f"Fertig ({len(by_dir)} Medien erkannt" + (f", {download_count} neu geladen)" if download_count else ")")
+        scan_progress["current_step"] = f"Fertig! ({scan_progress['new_downloaded']} geladen, {scan_progress['failed']} übersprungen/fehlend)"
     except Exception as e:
-        scan_status_msg = f"Fehler: {e}"
-        scan_details_log.append(f"❌ Fehler: {e}")
-        print(f"[Scan Fehler] {e}")
+        scan_progress["current_step"] = f"Fehler beim Scan: {e}"
+        print(f"[Scan Gesamtfehler] {e}")
     finally:
-        is_scanning = False
+        scan_progress["is_running"] = False
 
 
 def background_scheduler():
@@ -647,6 +750,11 @@ def stream_audio(item_id: str):
     if not mp3.exists():
         raise HTTPException(status_code=404)
     return FileResponse(mp3, media_type="audio/mpeg")
+
+
+@app.get("/api/progress")
+def get_progress():
+    return scan_progress
 
 
 @app.post("/scan")
@@ -759,11 +867,31 @@ def delete_theme(item_id: str):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", filter_status: str = "all", filter_type: str = "all", settings: str = ""):
+def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings: str = ""):
     cfg = load_config()
     state = load_state()
-    items = list(state["items"].values())
-    items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
+    all_items = list(state["items"].values())
+
+    # Count stats
+    total_filme = sum(1 for i in all_items if i.get("type") == "Film")
+    filme_ok = sum(1 for i in all_items if i.get("type") == "Film" and i.get("has_theme"))
+    
+    total_serien = sum(1 for i in all_items if i.get("type") == "Serie")
+    serien_ok = sum(1 for i in all_items if i.get("type") == "Serie" and i.get("has_theme"))
+
+    total_cols = sum(1 for i in all_items if i.get("type") == "Collection")
+    cols_ok = sum(1 for i in all_items if i.get("type") == "Collection" and i.get("has_theme"))
+
+    scanned_folders = state.get("folders", [])
+
+    # Filter items according to active tab
+    type_map = {"filme": "Film", "serien": "Serie", "collections": "Collection"}
+    target_type = type_map.get(tab.lower())
+
+    if target_type:
+        items = [i for i in all_items if i.get("type") == target_type]
+    else:
+        items = all_items
 
     if q:
         items = [
@@ -774,12 +902,8 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
         items = [i for i in items if not i.get("has_theme")]
     elif filter_status == "ok":
         items = [i for i in items if i.get("has_theme")]
-    if filter_type != "all":
-        items = [i for i in items if i.get("type") == filter_type]
 
-    total = len(state["items"])
-    present = sum(1 for i in state["items"].values() if i.get("has_theme"))
-    col_count = sum(1 for i in state["items"].values() if i.get("type") == "Collection")
+    items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
 
     rows = ""
     for it in items:
@@ -799,30 +923,34 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             if it.get("has_theme")
             else "-"
         )
+        
+        status_color = "#5ce69a" if it.get("has_theme") else "#ff7b7b"
+        status_display = it.get("video_title") or it.get("status")
+
         rows += f"""
         <tr>
-            <td><strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
-                <span class="meta">{it['type']} • {it['source']} • {it.get('video_title') or it.get('status')}</span>
+            <td>
+                <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
+                <span class="meta">Quelle: {it['source']} • Pfad: <code>{it.get('dir')}</code></span><br>
+                <span style="font-size:0.8rem; color:{status_color};">Status: {status_display}</span>
             </td>
             <td>{badge}</td>
             <td>{player}</td>
             <td>
                 <form method="post" action="/replace/{iid}" class="inline-form">
-                    <input type="text" name="custom_input" placeholder="Leer = Treffer / Suchbegriff / URL">
-                    <button type="submit">Laden / Neu</button>
+                    <input type="text" name="custom_input" placeholder="YouTube URL oder Suchbegriff...">
+                    <button type="submit">Laden / Ersetzen</button>
                 </form>
                 <form method="post" action="/delete/{iid}" style="display:inline;">
-                    <button type="submit" class="danger">✕</button>
+                    <button type="submit" class="danger" title="Löschen & auf Blacklist setzen">✕</button>
                 </form>
             </td>
         </tr>
         """
 
     saved_banner = '<div class="banner">✓ Einstellungen gespeichert & Scan gestartet!</div>' if settings == "saved" else ""
-    scan_info = f" • ⏳ {scan_status_msg}" if is_scanning else (f" • {scan_status_msg}" if scan_status_msg else "")
-    details_html = ""
-    if scan_details_log:
-        details_html = "<div style='font-size:0.85rem; color:#8b929a; margin-top:6px;'>" + " • ".join(scan_details_log) + "</div>"
+
+    folder_list_html = "".join(f"<li style='margin-bottom:6px;'><code>{f}</code></li>" for f in scanned_folders) or "<li>Bisher keine Ordner erfasst. Starte einen Scan!</li>"
 
     return f"""
     <!doctype html>
@@ -848,7 +976,7 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             }}
             * {{ box-sizing: border-box; }}
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }}
-            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 14px; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 14px; }}
             h1 {{ margin: 0; font-size: 1.6rem; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }}
             .stats {{ color: var(--text-muted); font-size: 0.95rem; margin-top: 4px; }}
             button, .btn {{ background: var(--primary); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.9rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }}
@@ -871,6 +999,18 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             audio {{ height: 32px; width: 220px; }}
             .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
             
+            /* PROGRESS BAR */
+            .progress-card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px; }}
+            .progress-bar-bg {{ background: #262a32; height: 12px; border-radius: 6px; overflow: hidden; margin: 10px 0; }}
+            .progress-bar-fill {{ background: #28a745; height: 100%; width: 0%; transition: width 0.3s ease; }}
+            
+            /* TABS */
+            .tab-nav {{ display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 8px; flex-wrap: wrap; }}
+            .tab-btn {{ background: transparent; color: var(--text-muted); border: 1px solid transparent; padding: 8px 16px; border-radius: 6px; font-size: 0.95rem; cursor: pointer; text-decoration: none; font-weight: 600; }}
+            .tab-btn:hover {{ background: #20242b; color: #fff; }}
+            .tab-btn.active {{ background: #2b7de9; color: #fff; }}
+            
+            /* SETTINGS MODAL */
             .settings-panel {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
             .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
             .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
@@ -887,18 +1027,32 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
         <div class="header">
             <div>
                 <h1>🎵 Theme Fetcher</h1>
-                <div class="stats">{present} von {total} Themes vorhanden ({col_count} Collections){scan_info}</div>
-                {details_html}
+                <div class="stats">Filme: {filme_ok}/{total_filme} • Serien: {serien_ok}/{total_serien} • Collections: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
                 <form method="post" action="/scan">
-                    <button type="submit">🔄 Jetzt scannen</button>
+                    <button type="submit">🔄 Jetzt scannen & laden</button>
                 </form>
             </div>
         </div>
 
         {saved_banner}
+
+        <!-- LIVE FORTSCHRITTSANZEIGE -->
+        <div id="progressCard" class="progress-card" style="display:none;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <strong id="progStep">Scan läuft...</strong>
+                <span id="progCount" style="color:var(--text-muted); font-size:0.9rem;">0 / 0</span>
+            </div>
+            <div class="progress-bar-bg">
+                <div id="progFill" class="progress-bar-fill"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-muted);">
+                <span id="progItem">Verarbeite...</span>
+                <span>Neu heruntergeladen: <strong id="progDown" style="color:#5ce69a;">0</strong></span>
+            </div>
+        </div>
 
         <!-- EINSTELLUNGEN PANEL -->
         <div id="settingsBox" class="settings-panel" style="display: {'block' if settings == 'open' else 'none'};">
@@ -913,8 +1067,8 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
                 <div class="settings-grid">
                     <div class="form-group" style="grid-column: 1 / -1;">
                         <label>Medienpfad(e) im Container</label>
-                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media oder /media/ZimaOS-HDD">
-                        <small style="color:var(--text-muted);">Standard ist <code>/media</code>. Entspricht dem Pfad, den du in Docker Compose unter volumes gemountet hast.</small>
+                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media">
+                        <small style="color:var(--text-muted);">Standard: <code>/media</code>. Wird mit deinen Docker Compose Volumes verknüpft.</small>
                         <div id="res_folder" class="test-result"></div>
                     </div>
                     <div class="checkbox-group">
@@ -935,11 +1089,10 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
                     <div class="form-group">
                         <label>Jellyfin Server-URL</label>
                         <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}" placeholder="http://192.168.178.X:8096">
-                        <small style="color:var(--text-muted);">Wichtig: Die echte IP deines ZimaOS (nicht localhost/127.0.0.1)</small>
                     </div>
                     <div class="form-group">
                         <label>Jellyfin API-Key</label>
-                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="In Jellyfin unter Dashboard > Erweitert > API-Schlüssel">
+                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="API-Key">
                     </div>
                     <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
 
@@ -978,44 +1131,84 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", set
             </form>
         </div>
 
-        <!-- FILTER & SUCHE -->
-        <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px;">
-            <form method="get" action="/" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <input type="text" name="q" value="{q}" placeholder="Titel / Originaltitel suchen..." style="flex:1; min-width:200px;">
-                <select name="filter_type" onchange="this.form.submit()">
-                    <option value="all" {'selected' if filter_type=='all' else ''}>Alle Typen</option>
-                    <option value="Film" {'selected' if filter_type=='Film' else ''}>Filme</option>
-                    <option value="Serie" {'selected' if filter_type=='Serie' else ''}>Serien</option>
-                    <option value="Collection" {'selected' if filter_type=='Collection' else ''}>Collections</option>
-                </select>
-                <select name="filter_status" onchange="this.form.submit()">
-                    <option value="all" {'selected' if filter_status=='all' else ''}>Alle Status</option>
-                    <option value="missing" {'selected' if filter_status=='missing' else ''}>Nur Fehlende</option>
-                    <option value="ok" {'selected' if filter_status=='ok' else ''}>Nur Vorhandene</option>
-                </select>
-                <button type="submit">Filtern</button>
-                {f'<a href="/" class="btn secondary">Filter zurücksetzen</a>' if (q or filter_status!='all' or filter_type!='all') else ''}
-            </form>
+        <!-- REITER / TABS (STRICKT GETRENNT) -->
+        <div class="tab-nav">
+            <a href="/?tab=filme" class="tab-btn {'active' if tab=='filme' else ''}">🎬 Filme ({filme_ok}/{total_filme})</a>
+            <a href="/?tab=serien" class="tab-btn {'active' if tab=='serien' else ''}">📺 Serien ({serien_ok}/{total_serien})</a>
+            <a href="/?tab=collections" class="tab-btn {'active' if tab=='collections' else ''}">📁 Collections ({cols_ok}/{total_cols})</a>
+            <a href="/?tab=ordner" class="tab-btn {'active' if tab=='ordner' else ''}">📂 Eingelesene Ordner ({len(scanned_folders)})</a>
         </div>
 
-        <!-- TABELLE -->
-        <table>
-            <thead>
-                <tr>
-                    <th>Titel [Originaltitel]</th>
-                    <th>Status</th>
-                    <th>Vorschau</th>
-                    <th>Aktion (Nächster Treffer / Suchbegriff / URL)</th>
-                </tr>
-            </thead>
-            <tbody>{rows or '<tr><td colspan="4" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge gefunden. Klicke oben auf ⚙️ Einstellungen, teste die Verbindung zu Jellyfin oder überprüfe den Ordnerpfad.</td></tr>'}</tbody>
-        </table>
+        {'<!-- ORDNER TAB -->' if tab == 'ordner' else ''}
+        <div style="display: {'block' if tab == 'ordner' else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
+            <h3 style="margin-top:0;">Gefundene & Eingelesene Verzeichnisse:</h3>
+            <p style="color:var(--text-muted); font-size:0.9rem;">Hier siehst du schwarz auf weiß, welche Ordner der Theme Fetcher über Festplatte oder Jellyfin/Plex erfasst hat:</p>
+            <ul style="line-height:1.8; font-size:0.95rem;">
+                {folder_list_html}
+            </ul>
+        </div>
+
+        <!-- FILTER & TABELLE (NUR FÜR FILME/SERIEN/COLLECTIONS) -->
+        <div style="display: {'none' if tab == 'ordner' else 'block'};">
+            <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px;">
+                <form method="get" action="/" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <input type="hidden" name="tab" value="{tab}">
+                    <input type="text" name="q" value="{q}" placeholder="{tab.capitalize()} suchen..." style="flex:1; min-width:200px;">
+                    <select name="filter_status" onchange="this.form.submit()">
+                        <option value="all" {'selected' if filter_status=='all' else ''}>Alle</option>
+                        <option value="missing" {'selected' if filter_status=='missing' else ''}>Nur Fehlende</option>
+                        <option value="ok" {'selected' if filter_status=='ok' else ''}>Nur Vorhandene</option>
+                    </select>
+                    <button type="submit">Suchen</button>
+                    {f'<a href="/?tab={tab}" class="btn secondary">Filter zurücksetzen</a>' if (q or filter_status!='all') else ''}
+                </form>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Titel & Pfad & Status</th>
+                        <th>Status</th>
+                        <th>Vorschau</th>
+                        <th>Aktion (Nächster Treffer / Link)</th>
+                    </tr>
+                </thead>
+                <tbody>{rows or f'<tr><td colspan="4" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge unter {tab.capitalize()} gefunden. Klicke oben auf 🔄 Jetzt scannen.</td></tr>'}</tbody>
+            </table>
+        </div>
 
         <script>
             function toggleSettings() {{
                 const el = document.getElementById('settingsBox');
                 el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
             }}
+
+            // LIVE PROGRESS POLLING
+            async function pollProgress() {{
+                try {{
+                    const resp = await fetch('/api/progress');
+                    const data = await resp.json();
+                    const card = document.getElementById('progressCard');
+                    
+                    if (data.is_running) {{
+                        card.style.display = 'block';
+                        document.getElementById('progStep').innerText = data.current_step;
+                        document.getElementById('progCount').innerText = data.processed + ' / ' + data.total + ' (' + data.percent + '%)';
+                        document.getElementById('progFill').style.width = data.percent + '%';
+                        document.getElementById('progItem').innerText = data.current_item || '';
+                        document.getElementById('progDown').innerText = data.new_downloaded;
+                    }} else if (data.processed > 0 && data.processed === data.total) {{
+                        // Just finished
+                        card.style.display = 'block';
+                        document.getElementById('progStep').innerText = data.current_step;
+                        document.getElementById('progFill').style.width = '100%';
+                        document.getElementById('progDown').innerText = data.new_downloaded;
+                    }}
+                }} catch (e) {{}}
+            }}
+
+            setInterval(pollProgress, 1500);
+            pollProgress();
 
             async function runTestJellyfin() {{
                 const resEl = document.getElementById('res_jf');
