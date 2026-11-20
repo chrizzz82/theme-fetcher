@@ -32,16 +32,24 @@ DEFAULT_CONFIG = {
     "jf_metadata_dir": os.getenv("JF_METADATA_DIR", "/jellyfin-metadata"),
     "plex_url": os.getenv("PLEX_URL", "").rstrip("/"),
     "plex_token": os.getenv("PLEX_TOKEN", ""),
+    "min_duration_sec": int(os.getenv("MIN_DURATION_SEC", "25")),
     "max_duration_sec": int(os.getenv("MAX_DURATION_SEC", "270")),
     "scan_interval_hours": int(os.getenv("SCAN_INTERVAL_HOURS", "12")),
+    "audio_fade": True,
+    "embed_cover": True,
     "auto_download": False
 }
 
+# STRIKTE FILTER: Verhindert Trailer, Szenen, Dialoge und Amateur-Müll
 EXCLUDE_KEYWORDS = [
-    "cover", "remix", "reaction", "reaktion", "1 hour", "10 hours", "loop",
-    "tutorial", "piano", "klavier", "guitar", "gitarre", "karaoke",
-    "full soundtrack", "full ost", "trailer", "ganzer film", "hörspiel",
-    "review", "kritik", "analys"
+    "scene", "szene", "clip", "movieclip", "movie clip", "dialog", "dialogue",
+    "teaser", "trailer", "ausschnitt", "interview", "making of", "featurette",
+    "reaction", "reaktion", "review", "kritik", "talk", "hörspiel", "ganzer film",
+    "full movie", "parody", "parodie", "gameplay", "walkthrough", "1 hour",
+    "10 hours", "loop", "tutorial", "piano", "klavier", "guitar", "gitarre",
+    "karaoke", "bass boosted", "nightcore", "slowed", "reverb", "8d audio",
+    "extended", "compilation", "suite", "blooper", "deleted scene", "fight scene",
+    "ending scene", "death scene"
 ]
 
 THEME_REGEX = re.compile(r"^themes?\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
@@ -51,7 +59,7 @@ stop_requested = False
 
 scan_progress = {
     "is_running": False,
-    "action_type": "",  # "scan" oder "download"
+    "action_type": "",
     "current_step": "Bereit",
     "current_item_id": "",
     "current_item_title": "",
@@ -63,6 +71,16 @@ scan_progress = {
     "queue": [],
     "recent_finished": []
 }
+
+
+def clean_url_input(val: str) -> str:
+    """Sorgt dafür, dass IPs ohne http:// automatisch mit http:// versehen werden"""
+    val = (val or "").strip().rstrip("/")
+    if not val:
+        return ""
+    if not val.startswith("http://") and not val.startswith("https://"):
+        return f"http://{val}"
+    return val
 
 
 def load_config() -> dict:
@@ -112,19 +130,17 @@ def normalize_tab(tab_name: str) -> str:
 
 
 def find_theme_file_in_dir(d: Path) -> Optional[Path]:
-    """Findet jede Theme-Datei unabhängig von Groß-/Kleinschreibung und Plural (theme.mp3, themes.mp3, Theme.mp3 etc.)"""
+    """Findet jede Theme-Datei unabhängig von Groß-/Kleinschreibung und Plural (theme.mp3, themes.mp3 etc.)"""
     if not d.exists() or not d.is_dir():
         return None
     try:
-        # 1. Direkte Suche nach theme.mp3 oder themes.mp3 usw.
         for f in d.iterdir():
-            if f.is_file() and THEME_REGEX.match(f.name) and f.stat().st_size > 1024:
+            if f.is_file() and THEME_REGEX.match(f.name):
                 return f
-        # 2. Prüfe Season/Staffel-Unterordner bei Serien
         for sub in d.iterdir():
             if sub.is_dir() and re.search(r"season|staffel|\bs\d+", sub.name, re.IGNORECASE):
                 for sf in sub.iterdir():
-                    if sf.is_file() and THEME_REGEX.match(sf.name) and sf.stat().st_size > 1024:
+                    if sf.is_file() and THEME_REGEX.match(sf.name):
                         return sf
     except Exception:
         pass
@@ -181,32 +197,27 @@ def resolve_media_path(raw_path_str: str) -> Path:
 
 
 def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
-    """Umfassende Prüfung: Findet theme.mp3 / themes.mp3 in allen Pfadvarianten"""
+    """Tiefensuche: Findet theme.mp3 auch bei abweichenden Mount-Pfaden und Unterordnern"""
     existing = existing or {}
     candidates = []
 
-    # 1. Pfad aus aktuellem Scan
     if it.get("dir"):
         candidates.append(Path(it["dir"]))
         candidates.append(resolve_media_path(it["dir"]))
 
-    # 2. Pfad aus früherem Zustand
     if existing.get("dir") and existing.get("dir") != it.get("dir"):
         candidates.append(Path(existing["dir"]))
         candidates.append(resolve_media_path(existing["dir"]))
 
-    # 3. Roher Pfad (falls Dateiname wie movie.mkv enthalten)
     raw_p = it.get("raw_path") or existing.get("raw_path")
     if raw_p:
         res = resolve_media_path(raw_p)
         candidates.append(res if res.is_dir() else res.parent)
 
-    # 4. Lokaler Cache
     item_id = it.get("id") or existing.get("id")
     if item_id:
         candidates.append(LOCAL_THEMES_DIR / item_id)
 
-    # Deduplizieren und testen
     seen = set()
     for d in candidates:
         d_str = str(d)
@@ -216,7 +227,6 @@ def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, s
 
         theme_file = find_theme_file_in_dir(d)
         if theme_file:
-            # Falls themes.mp3 statt theme.mp3 heißt: symlinken/kopieren für Jellyfin Kompatibilität
             if theme_file.name.lower() != "theme.mp3":
                 standard_mp3 = d / "theme.mp3"
                 if not standard_mp3.exists():
@@ -227,19 +237,23 @@ def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, s
                         pass
             return True, d_str, theme_file
 
-    # 5. Durchsuche /media nach Ordner mit Titel-Ähnlichkeit (z.B. bei abweichenden Mounts)
-    title_slug = slugify(it.get("title", ""))
+    # Robuste Tiefensuche im gesamten /media Mount nach Ordner mit dem Serientitel/Filmtitel
+    title_raw = it.get("title", "").strip().lower()
+    title_slug = slugify(title_raw)
     media_base = Path("/media")
-    if media_base.exists() and len(title_slug) > 3:
+    if media_base.exists() and len(title_slug) >= 3:
         try:
             for root, dirs, _ in os.walk(media_base):
                 for d in dirs:
-                    if slugify(d) == title_slug or title_slug in slugify(d):
+                    d_lower = d.lower()
+                    if d_lower == title_raw or slugify(d) == title_slug or title_slug in slugify(d):
                         cand_dir = Path(root) / d
                         theme_file = find_theme_file_in_dir(cand_dir)
                         if theme_file:
                             return True, str(cand_dir), theme_file
-                if len(Path(root).relative_to(media_base).parts) >= 2:
+                        # Falls Verzeichnis existiert, aber noch kein Theme hat: Pfad trotzdem korrigieren
+                        it["dir"] = str(cand_dir)
+                if len(Path(root).relative_to(media_base).parts) >= 3:
                     dirs.clear()
         except Exception:
             pass
@@ -274,12 +288,13 @@ def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
             print(f"[Collection Sync Warnung] {e}")
 
 
-def scan_local_folders(paths_str: str, filter_type: Optional[str] = None) -> tuple[List[dict], List[str]]:
+def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclude_dirs: set = None) -> tuple[List[dict], List[str]]:
     results = []
     scanned_dirs = []
     if not paths_str:
         return results, scanned_dirs
 
+    exclude_dirs = exclude_dirs or set()
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
 
@@ -298,6 +313,10 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None) -> tup
 
                 rpath = Path(root)
                 if rpath.name.startswith(".") or rpath.name.lower() in ("@eadir", "$recycle.bin", "system volume information"):
+                    continue
+
+                # DEDUPLIZIERUNG: Wenn dieser Ordner bereits von Jellyfin erfasst wurde -> Überspringen!
+                if str(rpath) in exclude_dirs:
                     continue
 
                 try:
@@ -356,12 +375,12 @@ def get_jellyfin_headers(api_key: str) -> dict:
 
 
 def test_jellyfin_connection(url: str, api_key: str) -> dict:
-    url = url.strip().rstrip("/")
+    url = clean_url_input(url)
     api_key = api_key.strip()
     if not url:
-        return {"ok": False, "msg": "Bitte zuerst eine Server-URL eintragen (z. B. http://192.168.178.X:8096)"}
+        return {"ok": False, "msg": "Bitte Jellyfin IP und Port eingeben (z. B. 192.168.178.50:8096)"}
     if not api_key:
-        return {"ok": False, "msg": "Bitte einen API-Key eintragen"}
+        return {"ok": False, "msg": "Bitte API-Key eintragen"}
 
     headers = get_jellyfin_headers(api_key)
     try:
@@ -392,16 +411,16 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
     except requests.exceptions.ConnectTimeout:
         return {"ok": False, "msg": "Zeitüberschreitung (Timeout). Läuft Jellyfin unter dieser IP und diesem Port?"}
     except requests.exceptions.ConnectionError:
-        return {"ok": False, "msg": "Verbindung abgelehnt. Falls 'localhost'/'127.0.0.1' eingetragen ist: Bitte die echte ZimaOS-IP (z. B. http://192.168.178.X:8096) verwenden!"}
+        return {"ok": False, "msg": "Verbindung abgelehnt. Bitte IP und Port prüfen (z. B. 192.168.178.50:8096)!"}
     except Exception as e:
         return {"ok": False, "msg": f"Fehler: {str(e)}"}
 
 
 def test_plex_connection(url: str, token: str) -> dict:
-    url = url.strip().rstrip("/")
+    url = clean_url_input(url)
     token = token.strip()
     if not url:
-        return {"ok": False, "msg": "Bitte Plex Server-URL eintragen"}
+        return {"ok": False, "msg": "Bitte Plex IP und Port eintragen (z. B. 192.168.178.50:32400)"}
     if not token:
         return {"ok": False, "msg": "Bitte Plex Token eintragen"}
 
@@ -430,7 +449,7 @@ def test_folder_path(paths_str: str) -> dict:
     for p in paths:
         path_obj = Path(p)
         if not path_obj.exists():
-            details.append(f"❌ '{p}' existiert nicht im Container (Mount in Docker Compose prüfen!)")
+            details.append(f"❌ '{p}' existiert nicht im Container")
         elif not path_obj.is_dir():
             details.append(f"❌ '{p}' ist kein Verzeichnis")
         else:
@@ -453,11 +472,7 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
     scanned_folders = []
     seen_ids = set()
 
-    type_mapping = {
-        "Film": "Movie",
-        "Serie": "Series",
-        "Collection": "BoxSet"
-    }
+    type_mapping = {"Film": "Movie", "Serie": "Series", "Collection": "BoxSet"}
     item_types = type_mapping.get(filter_type, "Movie,Series,BoxSet")
 
     try:
@@ -623,6 +638,7 @@ def fetch_plex_items(url: str, token: str, filter_type: Optional[str] = None) ->
 
 
 def build_search_queries(item: dict) -> List[str]:
+    """Exakte Suchanfragen für REINE Musik ohne Trailer oder Gerede"""
     title = item["title"].strip()
     orig = (item.get("original_title") or "").strip()
     year = item.get("year")
@@ -630,30 +646,32 @@ def build_search_queries(item: dict) -> List[str]:
     queries = []
 
     if itype == "Serie":
-        queries.append(f"ytsearch6:{title} Theme Song")
-        queries.append(f"ytsearch5:{title} Titelmelodie")
+        queries.append(f"ytsearch6:{title} Opening Theme Song Soundtrack")
+        queries.append(f"ytsearch5:{title} Titelmelodie Instrumental")
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} Theme Song")
-            queries.append(f"ytsearch5:{orig} Opening Theme")
+            queries.append(f"ytsearch6:{orig} TV Theme Song Audio")
+            queries.append(f"ytsearch5:{orig} Opening Credits Soundtrack")
     elif itype == "Collection":
-        queries.append(f"ytsearch6:{title} Main Theme")
+        queries.append(f"ytsearch6:{title} Soundtrack Main Theme")
         clean_col = re.sub(r"\b(collection|reihe|sammlung|filmreihe)\b", "", title, flags=re.IGNORECASE).strip()
         if clean_col and clean_col.lower() != title.lower():
-            queries.append(f"ytsearch6:{clean_col} Main Theme")
+            queries.append(f"ytsearch6:{clean_col} Main Theme Soundtrack")
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} Main Theme")
+            queries.append(f"ytsearch6:{orig} Main Theme Score")
     else:
+        # Filme: Fokus auf 'Soundtrack Main Title' oder 'Official Audio Theme'
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} {year or ''} Main Theme".strip())
-        queries.append(f"ytsearch6:{title} {year or ''} Main Theme".strip())
-        queries.append(f"ytsearch5:{title} Titelmelodie")
+            queries.append(f"ytsearch6:{orig} {year or ''} Soundtrack Main Title".strip())
+            queries.append(f"ytsearch5:{orig} Official Audio Theme")
+        queries.append(f"ytsearch6:{title} {year or ''} Soundtrack Main Title".strip())
+        queries.append(f"ytsearch5:{title} Titelmusik Instrumental")
 
     base_name = orig if orig else title
-    queries.append(f"scsearch5:{base_name} Main Theme")
+    queries.append(f"scsearch5:{base_name} Main Theme Soundtrack")
     return queries
 
 
-def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> tuple[Optional[dict], str]:
+def find_candidate(search_expr: str, blacklist: List[str], min_dur: int, max_dur: int) -> tuple[Optional[dict], str]:
     cmd = [
         "yt-dlp",
         search_expr,
@@ -684,20 +702,64 @@ def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> tupl
 
             if not url or vid_id in blacklist:
                 continue
-            if duration and duration > max_dur:
+            if duration and (duration < min_dur or duration > max_dur):
                 continue
+
+            # Harter Ausschluss: Keine Trailer, keine Szenen, kein Gerede
             if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
                 continue
 
-            return {"id": vid_id or url, "url": url, "title": vid_title}, "OK"
-        return None, "Kein Treffer unter max. Dauer"
+            return {"id": vid_id or url, "url": url, "title": vid_title, "duration": duration}, "OK"
+        return None, "Kein Treffer: Suchergebnisse enthielten Trailer/Szenen oder überschritten die Laufzeit"
     except subprocess.TimeoutExpired:
         return None, "Such-Timeout"
     except Exception as e:
         return None, f"Suchfehler: {str(e)}"
 
 
-def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata") -> dict:
+def post_process_audio(input_file: Path, output_file: Path, duration: int, fade: bool = True, cover_path: Optional[Path] = None):
+    """Wendet sanftes Audio-Fade-In/-Out an und bettet optional das Cover-Bild ein"""
+    temp_processed = input_file.parent / f"processed_{input_file.name}"
+    
+    # Audio-Filter: 1.5s Fade-In, 3s Fade-Out
+    af_filter = []
+    if fade:
+        af_filter.append("afade=t=in:ss=0:d=1.5")
+        if duration and duration > 6:
+            out_start = max(1.0, duration - 3.0)
+            af_filter.append(f"afade=t=out:st={out_start}:d=3.0")
+
+    af_arg = ",".join(af_filter) if af_filter else "anull"
+
+    cmd = ["ffmpeg", "-y", "-i", str(input_file)]
+    
+    if cover_path and cover_path.exists():
+        cmd.extend(["-i", str(cover_path), "-map", "0:a", "-map", "1:v", "-c:a", "libmp3lame", "-b:a", "192k", "-c:v", "copy", "-id3v2_version", "3", "-metadata:s:v", 'title="Album cover"', "-metadata:s:v", 'comment="Cover (front)"'])
+    else:
+        cmd.extend(["-c:a", "libmp3lame", "-b:a", "192k"])
+
+    cmd.extend(["-af", af_arg, str(temp_processed)])
+
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        if temp_processed.exists() and temp_processed.stat().st_size > 1024:
+            if output_file.exists():
+                output_file.unlink()
+            temp_processed.rename(output_file)
+            input_file.unlink(missing_ok=True)
+            return True
+    except Exception as e:
+        print(f"[FFmpeg Filter Warnung] {e}")
+
+    # Fallback
+    if input_file.exists():
+        if output_file.exists():
+            output_file.unlink()
+        input_file.rename(output_file)
+    return True
+
+
+def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
     blacklist = blacklist or []
     target_dir = Path(item["dir"])
 
@@ -726,7 +788,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
     search_reason = ""
 
     if is_direct_url:
-        chosen_video = {"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url}
+        chosen_video = {"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}
     else:
         search_list = (
             [f"ytsearch8:{custom_query_or_url}", f"scsearch5:{custom_query_or_url}"]
@@ -735,7 +797,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         )
         try:
             for expr in search_list:
-                cand, reason = find_candidate(expr, blacklist, max_dur)
+                cand, reason = find_candidate(expr, blacklist, min_dur, max_dur)
                 if cand:
                     chosen_video = cand
                     break
@@ -764,10 +826,18 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
         downloaded = target_dir / "theme_temp.mp3"
         if downloaded.exists():
-            if output_mp3.exists():
-                output_mp3.unlink()
-            downloaded.rename(output_mp3)
+            # Lokales Cover suchen
+            cover_file = None
+            for fname in ("poster.jpg", "folder.jpg", "cover.jpg"):
+                c_cand = target_dir / fname
+                if c_cand.exists():
+                    cover_file = c_cand
+                    break
+
+            # Audio filtern (Fade-In/Out) & ggf. Cover einbetten
+            post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade, cover_path=cover_file)
             sync_collection_theme(item, output_mp3, jf_meta_base)
+
             return {
                 "ok": True,
                 "video_id": chosen_video["id"],
@@ -802,24 +872,37 @@ def run_scan(scope: str = "all"):
 
         raw_items = []
         all_scanned_folders = []
+        jf_dirs = set()
 
-        if cfg.get("local_scan_enabled", True):
-            scan_progress["current_step"] = "Prüfe lokale Medienordner..."
-            loc_items, loc_folders = scan_local_folders(cfg.get("local_media_paths", "/media"), filter_type=filter_type)
-            raw_items.extend(loc_items)
-            all_scanned_folders.extend(loc_folders)
-
+        # 1. Medienserver einlesen (Jellyfin hat Priorität)
         if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
             scan_progress["current_step"] = f"Lese Jellyfin ({scope_name}) ein..."
             jf_items, jf_folders = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""), filter_type=filter_type)
             raw_items.extend(jf_items)
             all_scanned_folders.extend(jf_folders)
+            for it in jf_items:
+                if it.get("dir"):
+                    jf_dirs.add(it["dir"])
 
         if cfg.get("plex_url") and cfg.get("plex_token"):
             scan_progress["current_step"] = f"Lese Plex ({scope_name}) ein..."
             plex_items, plex_folders = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""), filter_type=filter_type)
             raw_items.extend(plex_items)
             all_scanned_folders.extend(plex_folders)
+            for it in plex_items:
+                if it.get("dir"):
+                    jf_dirs.add(it["dir"])
+
+        # 2. Lokale Medienquellen einlesen (mit DEDUPLIZIERUNG gegen Jellyfin)
+        if cfg.get("local_scan_enabled", True):
+            scan_progress["current_step"] = "Prüfe lokale Medienordner..."
+            loc_items, loc_folders = scan_local_folders(
+                cfg.get("local_media_paths", "/media"),
+                filter_type=filter_type,
+                exclude_dirs=jf_dirs
+            )
+            raw_items.extend(loc_items)
+            all_scanned_folders.extend(loc_folders)
 
         by_dir = {}
         for it in raw_items:
@@ -896,7 +979,9 @@ def run_download_queue(scope: str = "all"):
     try:
         cfg = load_config()
         state = load_state()
+        min_dur = cfg.get("min_duration_sec", 25)
         max_dur = cfg.get("max_duration_sec", 270)
+        fade_active = cfg.get("audio_fade", True)
         jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
         all_missing = [it for it in state["items"].values() if not it.get("has_theme")]
@@ -931,7 +1016,14 @@ def run_download_queue(scope: str = "all"):
                 scan_progress["queue"].pop(0)
 
             bl = state["blacklist"].get(item_id, [])
-            dl_res = search_and_download(it, blacklist=bl, max_dur=max_dur, jf_meta_base=jf_meta)
+            dl_res = search_and_download(
+                it,
+                blacklist=bl,
+                min_dur=min_dur,
+                max_dur=max_dur,
+                jf_meta_base=jf_meta,
+                fade=fade_active
+            )
 
             if dl_res["ok"]:
                 it["has_theme"] = True
@@ -1107,8 +1199,10 @@ def replace_theme(
         item,
         custom_query_or_url=custom_input.strip() or None,
         blacklist=state["blacklist"].get(item_id, []),
+        min_dur=cfg.get("min_duration_sec", 25),
         max_dur=cfg.get("max_duration_sec", 270),
-        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata")
+        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata"),
+        fade=cfg.get("audio_fade", True)
     )
     if dl_res["ok"]:
         item["has_theme"] = True
@@ -1149,6 +1243,7 @@ def delete_theme(
     return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
 
 
+# TEST API ENDPOINTS
 class TestJellyfinReq(BaseModel):
     url: str
     api_key: str
@@ -1173,6 +1268,224 @@ def api_test_folder(data: TestFolderReq):
     return test_folder_path(data.paths)
 
 
+# SEPARATE EINSTELLUNGS-SEITE (/settings)
+@app.get("/settings", response_class=HTMLResponse)
+def get_settings_page():
+    cfg = load_config()
+    return f"""
+    <!doctype html>
+    <html lang="de">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Einstellungen • Theme Fetcher</title>
+        <style>
+            :root {{
+                --bg: #121417;
+                --card-bg: #181b20;
+                --border: #262a32;
+                --text: #e4e6eb;
+                --text-muted: #9aa0a6;
+                --primary: #2b7de9;
+                --primary-hover: #1b66c9;
+                --success: #28a745;
+                --danger: #c93b3b;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; max-width: 900px; margin: 0 auto; }}
+            .nav-back {{ margin-bottom: 20px; }}
+            .nav-back a {{ color: var(--text-muted); text-decoration: none; font-size: 0.95rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }}
+            .nav-back a:hover {{ color: #fff; }}
+            h1 {{ margin: 0 0 20px 0; font-size: 1.7rem; }}
+            .card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 22px; margin-bottom: 20px; }}
+            .card h2 {{ margin-top: 0; font-size: 1.15rem; border-bottom: 1px solid var(--border); padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }}
+            .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
+            .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
+            .form-group label {{ font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }}
+            .form-group small {{ font-size: 0.78rem; color: #7d8590; }}
+            input[type="text"], input[type="number"] {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; }}
+            input[type="text"]:focus, input[type="number"]:focus {{ outline: none; border-color: var(--primary); }}
+            .checkbox-group {{ display: flex; align-items: center; gap: 10px; font-size: 0.9rem; margin-top: 6px; }}
+            .checkbox-group input {{ width: 18px; height: 18px; cursor: pointer; }}
+            button, .btn {{ background: var(--primary); color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.95rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }}
+            button.test {{ background: #2f3e54; color: #7db2ff; border: 1px solid #415575; font-size: 0.8rem; padding: 6px 12px; }}
+            .test-result {{ margin-top: 6px; font-size: 0.85rem; padding: 8px 12px; border-radius: 4px; display: none; }}
+            .test-result.ok {{ display: block; background: #133824; color: #5ce69a; border: 1px solid #1f5938; }}
+            .test-result.err {{ display: block; background: #421c1c; color: #ff8585; border: 1px solid #6b2d2d; }}
+        </style>
+    </head>
+    <body>
+        <div class="nav-back">
+            <a href="/">← Zurück zur Mediathek</a>
+        </div>
+        <h1>⚙️ Einstellungen & Quellen</h1>
+
+        <form method="post" action="/settings">
+            
+            <!-- 1. FESTPLATTE -->
+            <div class="card">
+                <h2>
+                    <span>📁 1. Lokale Medienquellen (Festplatte)</span>
+                    <button type="button" class="test" onclick="runTestFolder()">📂 Pfad testen</button>
+                </h2>
+                <div class="form-grid">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>Medienpfad(e) im Container</label>
+                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}">
+                        <small>Standard: <code>/media</code>. Entspricht deinem Docker Volume Mount.</small>
+                        <div id="res_folder" class="test-result"></div>
+                    </div>
+                    <div class="checkbox-group" style="grid-column: 1 / -1;">
+                        <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
+                        <label for="local_scan_enabled">Lokalen Festplatten-Scan aktivieren (wird automatisch mit Jellyfin dedupliziert)</label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. JELLYFIN & PLEX -->
+            <div class="card">
+                <h2>
+                    <span>🎬 2. Medienserver (Jellyfin / Plex)</span>
+                    <div style="display:flex; gap:6px;">
+                        <button type="button" class="test" onclick="runTestJellyfin()">🔌 Jellyfin testen</button>
+                        <button type="button" class="test" onclick="runTestPlex()">🍿 Plex testen</button>
+                    </div>
+                </h2>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Jellyfin Server-IP & Port</label>
+                        <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}">
+                        <small>Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Jellyfin API-Key</label>
+                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}">
+                        <small>Erstellt unter Jellyfin: Dashboard ➔ API-Schlüssel</small>
+                    </div>
+                    <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
+
+                    <div class="form-group">
+                        <label>Plex Server-IP & Port (Optional)</label>
+                        <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}">
+                        <small>Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Plex Token (Optional)</label>
+                        <input type="text" id="cfg_plex_token" name="plex_token" value="{cfg.get('plex_token', '')}">
+                        <small>Dein persönlicher X-Plex-Token</small>
+                    </div>
+                    <div id="res_plex" class="test-result" style="grid-column: 1 / -1;"></div>
+                </div>
+            </div>
+
+            <!-- 3. DOWNLOAD-KRITERIEN -->
+            <div class="card">
+                <h2>⚡ 3. Download-Kriterien & Audio-Veredelung</h2>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Min. Titellänge (Sekunden)</label>
+                        <input type="number" name="min_duration_sec" value="{cfg.get('min_duration_sec', 25)}">
+                        <small>Verhindert Jingles und kurze Soundeffekte (Standard: 25s)</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Max. Titellänge (Sekunden)</label>
+                        <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
+                        <small>Verhindert ganze Alben und 1-Stunden-Loops (Standard: 270s)</small>
+                    </div>
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="audio_fade" name="audio_fade" {'checked' if cfg.get('audio_fade', True) else ''}>
+                        <label for="audio_fade"><strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s weich anblenden, 3s ausblenden</label>
+                    </div>
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="embed_cover" name="embed_cover" {'checked' if cfg.get('embed_cover', True) else ''}>
+                        <label for="embed_cover"><strong>Cover-Bild direkt in MP3 einbetten (ID3-Tag)</strong></label>
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin-top:20px; display:flex; gap:12px;">
+                <button type="submit" style="background:#28a745; font-size:1.05rem; padding:12px 24px;">💾 Einstellungen speichern & anwenden</button>
+                <a href="/" class="btn" style="background:#2a2e36;">Abbrechen</a>
+            </div>
+        </form>
+
+        <script>
+            async function runTestJellyfin() {{
+                const resEl = document.getElementById('res_jf');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Verbindung zu Jellyfin...';
+                
+                const url = document.getElementById('cfg_jf_url').value;
+                const apiKey = document.getElementById('cfg_jf_key').value;
+
+                try {{
+                    const resp = await fetch('/api/test-jellyfin', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, api_key: apiKey }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                }}
+            }}
+
+            async function runTestPlex() {{
+                const resEl = document.getElementById('res_plex');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Verbindung zu Plex...';
+                
+                const url = document.getElementById('cfg_plex_url').value;
+                const token = document.getElementById('cfg_plex_token').value;
+
+                try {{
+                    const resp = await fetch('/api/test-plex', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ url: url, token: token }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                }}
+            }}
+
+            async function runTestFolder() {{
+                const resEl = document.getElementById('res_folder');
+                resEl.className = 'test-result';
+                resEl.style.display = 'block';
+                resEl.innerText = 'Prüfe Medienpfad im Container...';
+                
+                const paths = document.getElementById('cfg_paths').value;
+
+                try {{
+                    const resp = await fetch('/api/test-folder', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ paths: paths }})
+                    }});
+                    const data = await resp.json();
+                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
+                    resEl.innerText = data.msg;
+                }} catch (e) {{
+                    resEl.className = 'test-result err';
+                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+
 @app.post("/settings")
 def update_settings(
     local_media_paths: str = Form("/media"),
@@ -1181,17 +1494,23 @@ def update_settings(
     jellyfin_api_key: str = Form(""),
     plex_url: str = Form(""),
     plex_token: str = Form(""),
+    min_duration_sec: int = Form(25),
     max_duration_sec: int = Form(270),
+    audio_fade: Optional[str] = Form(None),
+    embed_cover: Optional[str] = Form(None),
     scan_interval_hours: int = Form(12)
 ):
     cfg = load_config()
     cfg["local_media_paths"] = local_media_paths.strip()
     cfg["local_scan_enabled"] = bool(local_scan_enabled)
-    cfg["jellyfin_url"] = jellyfin_url.strip().rstrip("/")
+    cfg["jellyfin_url"] = clean_url_input(jellyfin_url)
     cfg["jellyfin_api_key"] = jellyfin_api_key.strip()
-    cfg["plex_url"] = plex_url.strip().rstrip("/")
+    cfg["plex_url"] = clean_url_input(plex_url)
     cfg["plex_token"] = plex_token.strip()
+    cfg["min_duration_sec"] = min_duration_sec
     cfg["max_duration_sec"] = max_duration_sec
+    cfg["audio_fade"] = bool(audio_fade)
+    cfg["embed_cover"] = bool(embed_cover)
     cfg["scan_interval_hours"] = scan_interval_hours
 
     save_config(cfg)
@@ -1199,6 +1518,7 @@ def update_settings(
     return RedirectResponse("/?settings=saved", status_code=303)
 
 
+# HAUPTANSICHT
 @app.get("/", response_class=HTMLResponse)
 def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings: str = ""):
     cfg = load_config()
@@ -1356,7 +1676,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             button.success:hover {{ background: #218838; }}
             button.danger {{ background: var(--danger); }}
             button.danger:hover {{ background: #a82e2e; }}
-            button.test {{ background: #2f3e54; color: #7db2ff; border: 1px solid #415575; font-size: 0.8rem; padding: 6px 12px; }}
             .btn-sm {{ padding: 4px 8px; font-size: 0.8rem; border-radius: 4px; }}
             input[type="text"], input[type="number"], select {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 7px 10px; border-radius: 6px; font-size: 0.85rem; }}
             input[type="text"]:focus, select:focus {{ outline: none; border-color: var(--primary); }}
@@ -1392,18 +1711,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             .pill.active {{ background: #2b7de9; color: #fff; border-color: #2b7de9; }}
             .pill.miss.active {{ background: #c93b3b; color: #fff; border-color: #c93b3b; }}
             .pill.ok.active {{ background: #28a745; color: #fff; border-color: #28a745; }}
-
-            /* SETTINGS MODAL */
-            .settings-panel {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
-            .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
-            .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
-            .form-group label {{ font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }}
-            .checkbox-group {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
-            .checkbox-group input {{ width: 18px; height: 18px; cursor: pointer; }}
-            .section-title {{ font-size: 1rem; font-weight: 700; margin-top: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; display:flex; justify-content:space-between; align-items:center; }}
-            .test-result {{ margin-top: 6px; font-size: 0.85rem; padding: 6px 10px; border-radius: 4px; display: none; }}
-            .test-result.ok {{ display: block; background: #133824; color: #5ce69a; border: 1px solid #1f5938; }}
-            .test-result.err {{ display: block; background: #421c1c; color: #ff8585; border: 1px solid #6b2d2d; }}
         </style>
     </head>
     <body>
@@ -1413,9 +1720,9 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 <div class="stats">Filme: {filme_ok}/{total_filme} • Serien: {serien_ok}/{total_serien} • Collections: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
+                <a href="/settings" class="btn secondary">⚙️ Einstellungen</a>
 
-                <!-- GEZIELTER SCAN (BLEIBT IM REITER) -->
+                <!-- GEZIELTER SCAN -->
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
                     <input type="hidden" name="tab" value="{clean_tab}">
@@ -1433,7 +1740,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <button type="submit" class="secondary" title="Kompletten Scan über alle Kategorien ausführen">🌐 Alles scannen</button>
                 </form>
 
-                <!-- GEZIELTER DOWNLOAD (BLEIBT IM REITER) -->
+                <!-- GEZIELTER DOWNLOAD -->
                 <form method="post" action="/download" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
                     <input type="hidden" name="tab" value="{clean_tab}">
@@ -1459,7 +1766,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </div>
             <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-muted);">
                 <span id="progItem">Verarbeite...</span>
-                <span>Erfolgreich geladen: <strong id="progDown" style="color:#5ce69a;">0</strong> | Übersprungen/Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
+                <span>Erfolgreich geladen: <strong id="progDown" style="color:#5ce69a;">0</strong> | Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
             </div>
 
             <!-- AUSKLAPPBARE WARTESCHLANGE & VERLAUF -->
@@ -1471,77 +1778,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </div>
         </div>
 
-        <!-- EINSTELLUNGEN PANEL -->
-        <div id="settingsBox" class="settings-panel" style="display: {'block' if settings == 'open' else 'none'};">
-            <h2 style="margin: 0 0 10px 0; font-size: 1.2rem;">⚙️ Einstellungen & Quellen</h2>
-            <form method="post" action="/settings">
-                
-                <div class="section-title">
-                    <span>📁 1. Lokale Medienquellen (Festplatte)</span>
-                    <button type="button" class="test" onclick="runTestFolder()">📂 Ordnerpfad testen</button>
-                </div>
-                <div class="settings-grid">
-                    <div class="form-group" style="grid-column: 1 / -1;">
-                        <label>Medienpfad(e) im Container</label>
-                        <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media">
-                        <small style="color:var(--text-muted);">Standard: <code>/media</code>. Entspricht deinem Festplatten-Mount.</small>
-                        <div id="res_folder" class="test-result"></div>
-                    </div>
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
-                        <label for="local_scan_enabled">Lokalen Festplatten-Scan zusätzlich aktivieren</label>
-                    </div>
-                </div>
-
-                <div class="section-title" style="margin-top:20px;">
-                    <span>🎬 2. Medienserver (Jellyfin / Plex)</span>
-                    <div style="display:flex; gap:6px;">
-                        <button type="button" class="test" onclick="runTestJellyfin()">🔌 Jellyfin testen</button>
-                        <button type="button" class="test" onclick="runTestPlex()">🍿 Plex testen</button>
-                    </div>
-                </div>
-                <div class="settings-grid">
-                    <div class="form-group">
-                        <label>Jellyfin Server-URL</label>
-                        <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}" placeholder="http://192.168.178.X:8096">
-                    </div>
-                    <div class="form-group">
-                        <label>Jellyfin API-Key</label>
-                        <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="API-Key">
-                    </div>
-                    <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
-
-                    <div class="form-group">
-                        <label>Plex Server-URL (Optional)</label>
-                        <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}" placeholder="http://192.168.178.X:32400">
-                    </div>
-                    <div class="form-group">
-                        <label>Plex Token (Optional)</label>
-                        <input type="text" id="cfg_plex_token" name="plex_token" value="{cfg.get('plex_token', '')}" placeholder="X-Plex-Token">
-                    </div>
-                    <div id="res_plex" class="test-result" style="grid-column: 1 / -1;"></div>
-                </div>
-
-                <div class="section-title" style="margin-top:20px;">⚡ 3. Download-Kriterien</div>
-                <div class="settings-grid">
-                    <div class="form-group">
-                        <label>Max. Titellänge (Sekunden)</label>
-                        <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
-                    </div>
-                    <div class="form-group">
-                        <label>Automatischer Scan-Intervall (Stunden)</label>
-                        <input type="number" name="scan_interval_hours" value="{cfg.get('scan_interval_hours', 12)}">
-                    </div>
-                </div>
-
-                <div style="margin-top:20px; display:flex; gap:10px;">
-                    <button type="submit" style="background:#28a745; font-size:1rem; padding:10px 20px;">💾 Einstellungen speichern</button>
-                    <button type="button" class="secondary" onclick="toggleSettings()">Schließen</button>
-                </div>
-            </form>
-        </div>
-
-        <!-- REITER / TABS (BLEIBEN BEI JEDER AKTION AKTIV) -->
+        <!-- REITER / TABS -->
         <div class="tab-nav">
             <a href="/?tab=filme&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='filme' else ''}">🎬 Filme ({filme_ok}/{total_filme})</a>
             <a href="/?tab=serien&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='serien' else ''}">📺 Serien ({serien_ok}/{total_serien})</a>
@@ -1562,7 +1799,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         <div style="display: {'none' if clean_tab == 'ordner' else 'block'};">
             <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px; display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
                 
-                <!-- KLARE FILTER-BUTTONS (PILLS) -->
                 <div class="pill-filter">
                     <span style="font-size:0.85rem; color:var(--text-muted); margin-right:4px;">Filter:</span>
                     <a href="/?tab={clean_tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">Alle ({tab_total})</a>
@@ -1570,7 +1806,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <a href="/?tab={clean_tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">✓ Vorhanden ({tab_ok})</a>
                 </div>
 
-                <!-- SUCHE -->
                 <form method="get" action="/" style="display:flex; gap:6px; align-items:center;">
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
@@ -1595,10 +1830,15 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         </div>
 
         <script>
-            function toggleSettings() {{
-                const el = document.getElementById('settingsBox');
-                el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
-            }}
+            // AUDIO-AUTOSTOPP: Wenn ein Player startet, stoppen alle anderen sofort!
+            document.addEventListener('play', function(e){{
+                var audios = document.getElementsByTagName('audio');
+                for(var i = 0, len = audios.length; i < len; i++){{
+                    if(audios[i] != e.target){{
+                        audios[i].pause();
+                    }}
+                }}
+            }}, true);
 
             async function cancelRunningAction() {{
                 try {{
@@ -1625,7 +1865,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         document.getElementById('progDown').innerText = data.new_downloaded;
                         document.getElementById('progFail').innerText = data.failed;
 
-                        // Zeige aktiven Downloadstatus in der jeweiligen Tabellenzeile
                         if (data.current_item_id) {{
                             const rowStatus = document.getElementById('status_box_' + data.current_item_id);
                             if (rowStatus) {{
@@ -1664,77 +1903,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
 
             setInterval(pollProgress, 1200);
             pollProgress();
-
-            async function runTestJellyfin() {{
-                const resEl = document.getElementById('res_jf');
-                resEl.className = 'test-result';
-                resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Verbindung zu Jellyfin...';
-                
-                const url = document.getElementById('cfg_jf_url').value;
-                const apiKey = document.getElementById('cfg_jf_key').value;
-
-                try {{
-                    const resp = await fetch('/api/test-jellyfin', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ url: url, api_key: apiKey }})
-                    }});
-                    const data = await resp.json();
-                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
-                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
-                }} catch (e) {{
-                    resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
-                }}
-            }}
-
-            async function runTestPlex() {{
-                const resEl = document.getElementById('res_plex');
-                resEl.className = 'test-result';
-                resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Verbindung zu Plex...';
-                
-                const url = document.getElementById('cfg_plex_url').value;
-                const token = document.getElementById('cfg_plex_token').value;
-
-                try {{
-                    const resp = await fetch('/api/test-plex', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ url: url, token: token }})
-                    }});
-                    const data = await resp.json();
-                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
-                    resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
-                }} catch (e) {{
-                    resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
-                }}
-            }}
-
-            async function runTestFolder() {{
-                const resEl = document.getElementById('res_folder');
-                resEl.className = 'test-result';
-                resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Medienpfad im Container...';
-                
-                const paths = document.getElementById('cfg_paths').value;
-
-                try {{
-                    const resp = await fetch('/api/test-folder', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ paths: paths }})
-                    }});
-                    const data = await resp.json();
-                    resEl.className = 'test-result ' + (data.ok ? 'ok' : 'err');
-                    resEl.innerText = data.msg;
-                }} catch (e) {{
-                    resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Server-Anfrage fehlgeschlagen: ' + e;
-                }}
-            }}
         </script>
     </body>
     </html>
