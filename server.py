@@ -44,22 +44,24 @@ EXCLUDE_KEYWORDS = [
     "review", "kritik", "analys"
 ]
 
+THEME_REGEX = re.compile(r"^themes?\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
+
 state_lock = threading.Lock()
 stop_requested = False
 
-# ERWEITERTER PROGRESS & QUEUE STATUS
 scan_progress = {
     "is_running": False,
     "action_type": "",  # "scan" oder "download"
     "current_step": "Bereit",
-    "current_item": "",
+    "current_item_id": "",
+    "current_item_title": "",
     "processed": 0,
     "total": 0,
     "percent": 0,
     "new_downloaded": 0,
     "failed": 0,
-    "queue": [],            # Nächste Titel in der Warteschlange
-    "recent_finished": []   # Zuletzt abgeschlossene Downloads mit Status
+    "queue": [],
+    "recent_finished": []
 }
 
 
@@ -95,55 +97,38 @@ def save_state(state: dict):
 
 def slugify(text: str) -> str:
     clean = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
-    return re.sub(r"[-\s]+", "_", clean) or "collection"
+    return re.sub(r"[-\s]+", "_", clean) or "item"
 
 
-def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Path]:
-    existing = existing or {}
-    candidates = []
-
-    if it.get("dir"):
-        candidates.append(Path(it["dir"]) / "theme.mp3")
-
-    if existing.get("dir") and existing.get("dir") != it.get("dir"):
-        candidates.append(Path(existing["dir"]) / "theme.mp3")
-
-    item_id = it.get("id") or existing.get("id")
-    if item_id:
-        candidates.append(LOCAL_THEMES_DIR / item_id / "theme.mp3")
-
-    for c in candidates:
-        if c.exists() and c.is_file() and c.stat().st_size > 0:
-            return True, str(c.parent), c
-
-    default_dir = it.get("dir") or (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")
-    return False, default_dir, Path(default_dir) / "theme.mp3"
+def normalize_tab(tab_name: str) -> str:
+    t = (tab_name or "").lower().strip()
+    if "seri" in t or "show" in t:
+        return "serien"
+    if "col" in t or "box" in t:
+        return "collections"
+    if "ordn" in t or "fold" in t:
+        return "ordner"
+    return "filme"
 
 
-def find_jellyfin_boxset_dir(title: str, jf_meta_base: str) -> Optional[Path]:
-    base = Path(jf_meta_base)
-    if not base.exists():
+def find_theme_file_in_dir(d: Path) -> Optional[Path]:
+    """Findet jede Theme-Datei unabhängig von Groß-/Kleinschreibung und Plural (theme.mp3, themes.mp3, Theme.mp3 etc.)"""
+    if not d.exists() or not d.is_dir():
         return None
-    target_slug = slugify(title)
     try:
-        for p in base.rglob("*"):
-            if p.is_dir() and slugify(p.name) == target_slug:
-                if any(x in str(p).lower() for x in ("boxset", "collection", "metadata")):
-                    return p
+        # 1. Direkte Suche nach theme.mp3 oder themes.mp3 usw.
+        for f in d.iterdir():
+            if f.is_file() and THEME_REGEX.match(f.name) and f.stat().st_size > 1024:
+                return f
+        # 2. Prüfe Season/Staffel-Unterordner bei Serien
+        for sub in d.iterdir():
+            if sub.is_dir() and re.search(r"season|staffel|\bs\d+", sub.name, re.IGNORECASE):
+                for sf in sub.iterdir():
+                    if sf.is_file() and THEME_REGEX.match(sf.name) and sf.stat().st_size > 1024:
+                        return sf
     except Exception:
         pass
     return None
-
-
-def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
-    if item.get("type") != "Collection" or not mp3_path.exists():
-        return
-    jf_dir = find_jellyfin_boxset_dir(item["title"], jf_meta_base)
-    if jf_dir:
-        try:
-            shutil.copy2(mp3_path, jf_dir / "theme.mp3")
-        except Exception as e:
-            print(f"[Collection Sync Warnung] {e}")
 
 
 def resolve_media_path(raw_path_str: str) -> Path:
@@ -195,6 +180,100 @@ def resolve_media_path(raw_path_str: str) -> Path:
     return cand1
 
 
+def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
+    """Umfassende Prüfung: Findet theme.mp3 / themes.mp3 in allen Pfadvarianten"""
+    existing = existing or {}
+    candidates = []
+
+    # 1. Pfad aus aktuellem Scan
+    if it.get("dir"):
+        candidates.append(Path(it["dir"]))
+        candidates.append(resolve_media_path(it["dir"]))
+
+    # 2. Pfad aus früherem Zustand
+    if existing.get("dir") and existing.get("dir") != it.get("dir"):
+        candidates.append(Path(existing["dir"]))
+        candidates.append(resolve_media_path(existing["dir"]))
+
+    # 3. Roher Pfad (falls Dateiname wie movie.mkv enthalten)
+    raw_p = it.get("raw_path") or existing.get("raw_path")
+    if raw_p:
+        res = resolve_media_path(raw_p)
+        candidates.append(res if res.is_dir() else res.parent)
+
+    # 4. Lokaler Cache
+    item_id = it.get("id") or existing.get("id")
+    if item_id:
+        candidates.append(LOCAL_THEMES_DIR / item_id)
+
+    # Deduplizieren und testen
+    seen = set()
+    for d in candidates:
+        d_str = str(d)
+        if d_str in seen:
+            continue
+        seen.add(d_str)
+
+        theme_file = find_theme_file_in_dir(d)
+        if theme_file:
+            # Falls themes.mp3 statt theme.mp3 heißt: symlinken/kopieren für Jellyfin Kompatibilität
+            if theme_file.name.lower() != "theme.mp3":
+                standard_mp3 = d / "theme.mp3"
+                if not standard_mp3.exists():
+                    try:
+                        shutil.copy2(theme_file, standard_mp3)
+                        theme_file = standard_mp3
+                    except Exception:
+                        pass
+            return True, d_str, theme_file
+
+    # 5. Durchsuche /media nach Ordner mit Titel-Ähnlichkeit (z.B. bei abweichenden Mounts)
+    title_slug = slugify(it.get("title", ""))
+    media_base = Path("/media")
+    if media_base.exists() and len(title_slug) > 3:
+        try:
+            for root, dirs, _ in os.walk(media_base):
+                for d in dirs:
+                    if slugify(d) == title_slug or title_slug in slugify(d):
+                        cand_dir = Path(root) / d
+                        theme_file = find_theme_file_in_dir(cand_dir)
+                        if theme_file:
+                            return True, str(cand_dir), theme_file
+                if len(Path(root).relative_to(media_base).parts) >= 2:
+                    dirs.clear()
+        except Exception:
+            pass
+
+    default_dir = str(candidates[0]) if candidates else (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")
+    return False, default_dir, None
+
+
+def find_jellyfin_boxset_dir(title: str, jf_meta_base: str) -> Optional[Path]:
+    base = Path(jf_meta_base)
+    if not base.exists():
+        return None
+    target_slug = slugify(title)
+    try:
+        for p in base.rglob("*"):
+            if p.is_dir() and slugify(p.name) == target_slug:
+                if any(x in str(p).lower() for x in ("boxset", "collection", "metadata")):
+                    return p
+    except Exception:
+        pass
+    return None
+
+
+def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
+    if item.get("type") != "Collection" or not mp3_path or not mp3_path.exists():
+        return
+    jf_dir = find_jellyfin_boxset_dir(item["title"], jf_meta_base)
+    if jf_dir:
+        try:
+            shutil.copy2(mp3_path, jf_dir / "theme.mp3")
+        except Exception as e:
+            print(f"[Collection Sync Warnung] {e}")
+
+
 def scan_local_folders(paths_str: str, filter_type: Optional[str] = None) -> tuple[List[dict], List[str]]:
     results = []
     scanned_dirs = []
@@ -229,7 +308,7 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None) -> tup
                     continue
 
                 has_video = any(Path(f).suffix.lower() in video_exts for f in files)
-                has_theme = (rpath / "theme.mp3").exists()
+                has_theme = bool(find_theme_file_in_dir(rpath))
                 has_seasons = any(re.search(r"season|staffel|specials", d, re.IGNORECASE) for d in dirs)
 
                 if has_video or has_theme or has_seasons:
@@ -453,6 +532,7 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
                 "original_title": item.get("OriginalTitle") or "",
                 "year": item.get("ProductionYear"),
                 "dir": str(target_dir),
+                "raw_path": raw_path,
                 "has_poster": has_image
             })
     except Exception as e:
@@ -510,6 +590,7 @@ def fetch_plex_items(url: str, token: str, filter_type: Optional[str] = None) ->
                     "original_title": video.get("originalTitle", ""),
                     "year": video.get("year"),
                     "dir": str(p),
+                    "raw_path": file_path,
                     "has_poster": bool(thumb)
                 })
 
@@ -698,7 +779,6 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
 
 def run_scan(scope: str = "all"):
-    """Scannt Mediatheken - entweder 'all' oder gezielt 'Film', 'Serie', 'Collection'"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -763,18 +843,19 @@ def run_scan(scope: str = "all"):
             item_id = it["id"]
             scan_progress["processed"] = idx
             scan_progress["percent"] = int((idx / max(1, total_items)) * 100)
-            scan_progress["current_item"] = f"Prüfe: {it['title']}"
+            scan_progress["current_item_title"] = f"{it['title']}"
+            scan_progress["current_item_id"] = item_id
 
             existing = state["items"].get(item_id, {})
             theme_exists, actual_dir, mp3_file = check_item_theme(it, existing)
 
             it["dir"] = actual_dir
 
-            if theme_exists and it.get("type") == "Collection":
+            if theme_exists and it.get("type") == "Collection" and mp3_file:
                 sync_collection_theme(it, mp3_file, jf_meta)
 
             if theme_exists:
-                status_txt = existing.get("video_title") or "Vorhanden"
+                status_txt = existing.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
             else:
                 prev_status = existing.get("status", "")
                 status_txt = prev_status if prev_status and prev_status != "Vorhanden" else "Fehlt"
@@ -797,7 +878,6 @@ def run_scan(scope: str = "all"):
 
 
 def run_download_queue(scope: str = "all"):
-    """Lädt fehlende Themes mit Live-Queue & Warteschlangenliste"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -832,7 +912,6 @@ def run_download_queue(scope: str = "all"):
             scan_progress["current_step"] = "Keine fehlenden Themes in dieser Kategorie!"
             return
 
-        # Warteschlange füllen
         scan_progress["queue"] = [it["title"] for it in missing_items]
 
         for idx, it in enumerate(missing_items, 1):
@@ -844,10 +923,10 @@ def run_download_queue(scope: str = "all"):
             title = it["title"]
             scan_progress["processed"] = idx
             scan_progress["percent"] = int((idx / total_missing) * 100)
-            scan_progress["current_item"] = f"{title} ({it.get('type')})"
+            scan_progress["current_item_title"] = f"{title} ({it.get('type')})"
+            scan_progress["current_item_id"] = item_id
             scan_progress["current_step"] = f"Lade ({idx}/{total_missing}): {title}..."
 
-            # Aus Queue entfernen
             if scan_progress["queue"]:
                 scan_progress["queue"].pop(0)
 
@@ -866,7 +945,6 @@ def run_download_queue(scope: str = "all"):
                 scan_progress["failed"] += 1
                 scan_progress["recent_finished"].insert(0, {"title": title, "ok": False, "msg": dl_res["msg"]})
 
-            # Max 8 Einträge in recent finished
             scan_progress["recent_finished"] = scan_progress["recent_finished"][:8]
 
             state["items"][item_id] = it
@@ -878,6 +956,7 @@ def run_download_queue(scope: str = "all"):
         scan_progress["current_step"] = f"Fehler beim Download: {e}"
     finally:
         scan_progress["is_running"] = False
+        scan_progress["current_item_id"] = ""
 
 
 @app.get("/poster/{item_id}")
@@ -931,7 +1010,7 @@ def stream_audio(item_id: str):
         raise HTTPException(status_code=404)
 
     has_theme, real_dir, mp3_file = check_item_theme(item)
-    if not has_theme or not mp3_file.exists():
+    if not has_theme or not mp3_file or not mp3_file.exists():
         raise HTTPException(status_code=404)
 
     return FileResponse(mp3_file, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
@@ -951,19 +1030,36 @@ def cancel_action():
 
 
 @app.post("/scan")
-def trigger_scan(scope: str = Form("all")):
+def trigger_scan(
+    scope: str = Form("all"),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
     threading.Thread(target=run_scan, kwargs={"scope": scope}, daemon=True).start()
-    return RedirectResponse(f"/?tab={scope.lower() if scope != 'all' else 'filme'}", status_code=303)
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
 
 
 @app.post("/download")
-def trigger_download(scope: str = Form("all")):
+def trigger_download(
+    scope: str = Form("all"),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
     threading.Thread(target=run_download_queue, kwargs={"scope": scope}, daemon=True).start()
-    return RedirectResponse(f"/?tab={scope.lower() if scope != 'all' else 'filme'}", status_code=303)
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
 
 
 @app.post("/scan-single/{item_id}")
-def scan_single(item_id: str):
+def scan_single(
+    item_id: str,
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
     state = load_state()
     cfg = load_config()
     item = state["items"].get(item_id)
@@ -974,15 +1070,83 @@ def scan_single(item_id: str):
     item["dir"] = actual_dir
     item["has_theme"] = theme_exists
     if theme_exists:
-        item["status"] = item.get("video_title") or "Vorhanden"
-        if item.get("type") == "Collection":
+        item["status"] = item.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
+        if item.get("type") == "Collection" and mp3_file:
             sync_collection_theme(item, mp3_file, cfg.get("jf_metadata_dir", "/jellyfin-metadata"))
     else:
         item["status"] = "Fehlt"
 
     state["items"][item_id] = item
     save_state(state)
-    return RedirectResponse(f"/?tab={item.get('type', 'Film').lower()}s", status_code=303)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/replace/{item_id}")
+def replace_theme(
+    item_id: str,
+    custom_input: str = Form(""),
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        raise HTTPException(status_code=404)
+
+    old_vid = item.get("video_id")
+    if old_vid:
+        bl = state["blacklist"].setdefault(item_id, [])
+        if old_vid not in bl:
+            bl.append(old_vid)
+
+    dl_res = search_and_download(
+        item,
+        custom_query_or_url=custom_input.strip() or None,
+        blacklist=state["blacklist"].get(item_id, []),
+        max_dur=cfg.get("max_duration_sec", 270),
+        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata")
+    )
+    if dl_res["ok"]:
+        item["has_theme"] = True
+        item["video_id"] = dl_res["video_id"]
+        item["video_title"] = dl_res["video_title"]
+        item["status"] = dl_res["video_title"] or "Heruntergeladen"
+    else:
+        item["status"] = dl_res["msg"]
+
+    state["items"][item_id] = item
+    save_state(state)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+@app.post("/delete/{item_id}")
+def delete_theme(
+    item_id: str,
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    item = state["items"].get(item_id)
+    if item:
+        for p in (Path(item.get("dir", "")) / "theme.mp3", LOCAL_THEMES_DIR / item["id"] / "theme.mp3"):
+            p.unlink(missing_ok=True)
+
+        old_vid = item.get("video_id")
+        if old_vid:
+            state["blacklist"].setdefault(item_id, []).append(old_vid)
+        item["has_theme"] = False
+        item["status"] = "Gelöscht (geblockt)"
+        save_state(state)
+
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
 
 
 class TestJellyfinReq(BaseModel):
@@ -1035,62 +1199,13 @@ def update_settings(
     return RedirectResponse("/?settings=saved", status_code=303)
 
 
-@app.post("/replace/{item_id}")
-def replace_theme(item_id: str, custom_input: str = Form("")):
-    state = load_state()
-    cfg = load_config()
-    item = state["items"].get(item_id)
-    if not item:
-        raise HTTPException(status_code=404)
-
-    old_vid = item.get("video_id")
-    if old_vid:
-        bl = state["blacklist"].setdefault(item_id, [])
-        if old_vid not in bl:
-            bl.append(old_vid)
-
-    dl_res = search_and_download(
-        item,
-        custom_query_or_url=custom_input.strip() or None,
-        blacklist=state["blacklist"].get(item_id, []),
-        max_dur=cfg.get("max_duration_sec", 270),
-        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata")
-    )
-    if dl_res["ok"]:
-        item["has_theme"] = True
-        item["video_id"] = dl_res["video_id"]
-        item["video_title"] = dl_res["video_title"]
-        item["status"] = dl_res["video_title"] or "Heruntergeladen"
-    else:
-        item["status"] = dl_res["msg"]
-
-    state["items"][item_id] = item
-    save_state(state)
-    return RedirectResponse(f"/?tab={item.get('type', 'Film').lower()}s", status_code=303)
-
-
-@app.post("/delete/{item_id}")
-def delete_theme(item_id: str):
-    state = load_state()
-    item = state["items"].get(item_id)
-    if item:
-        for p in (Path(item.get("dir", "")) / "theme.mp3", LOCAL_THEMES_DIR / item["id"] / "theme.mp3"):
-            p.unlink(missing_ok=True)
-
-        old_vid = item.get("video_id")
-        if old_vid:
-            state["blacklist"].setdefault(item_id, []).append(old_vid)
-        item["has_theme"] = False
-        item["status"] = "Gelöscht (geblockt)"
-        save_state(state)
-    return RedirectResponse(f"/?tab={item.get('type', 'Film').lower()}s", status_code=303)
-
-
 @app.get("/", response_class=HTMLResponse)
 def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings: str = ""):
     cfg = load_config()
     state = load_state()
     all_items = list(state["items"].values())
+
+    clean_tab = normalize_tab(tab)
 
     total_filme = sum(1 for i in all_items if i.get("type") == "Film")
     filme_ok = sum(1 for i in all_items if i.get("type") == "Film" and i.get("has_theme"))
@@ -1107,15 +1222,13 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     scanned_folders = state.get("folders", [])
 
     type_map = {"filme": "Film", "serien": "Serie", "collections": "Collection"}
-    current_scope = type_map.get(tab.lower(), "Film")
+    current_scope = type_map.get(clean_tab, "Film")
 
-    # Scope items
     tab_items = [i for i in all_items if i.get("type") == current_scope]
     tab_total = len(tab_items)
     tab_ok = sum(1 for i in tab_items if i.get("has_theme"))
     tab_miss = tab_total - tab_ok
 
-    # Filter by search and status
     items = tab_items
     if q:
         items = [
@@ -1151,8 +1264,8 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         )
 
         if has_theme:
-            v_title = it.get("video_title") or ""
-            sub_info = f"<div style='font-size:0.75rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>" if v_title else ""
+            v_title = it.get("video_title") or it.get("status") or "theme.mp3"
+            sub_info = f"<div style='font-size:0.75rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>"
         else:
             err_msg = it.get("status") or ""
             if err_msg and err_msg != "Fehlt" and err_msg != "Vorhanden":
@@ -1161,7 +1274,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 sub_info = ""
 
         rows += f"""
-        <tr>
+        <tr id="row_{iid}">
             <td style="width: 50px; padding: 6px;">
                 <img src="/poster/{iid}" style="width: 44px; height: 64px; object-fit: cover; border-radius: 4px; display: block;" loading="lazy" alt="Cover">
             </td>
@@ -1170,20 +1283,31 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
             </td>
             <td>
-                {badge}
-                {sub_info}
+                <div id="status_box_{iid}">
+                    {badge}
+                    {sub_info}
+                </div>
             </td>
             <td>{player}</td>
             <td style="white-space: nowrap;">
                 <div style="display:inline-flex; gap:4px; align-items:center;">
-                    <form method="post" action="/replace/{iid}" class="inline-form">
+                    <form method="post" action="/replace/{iid}" class="inline-form" onsubmit="this.querySelector('button').innerText='⏳ Lädt...';">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
                         <input type="text" name="custom_input" placeholder="YouTube URL / Begriff..." style="width:130px; font-size:0.8rem; padding:4px 6px;">
                         <button type="submit" class="btn-sm" title="Jetzt suchen & laden">▶️ Laden</button>
                     </form>
-                    <form method="post" action="/scan-single/{iid}" style="display:inline;">
+                    <form method="post" action="/scan-single/{iid}" style="display:inline;" onsubmit="this.querySelector('button').innerText='⏳';">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
                         <button type="submit" class="btn-sm secondary" title="Nur diesen Eintrag neu prüfen">🔄</button>
                     </form>
-                    <form method="post" action="/delete/{iid}" style="display:inline;">
+                    <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('Theme löschen und sperren?');">
+                        <input type="hidden" name="tab" value="{clean_tab}">
+                        <input type="hidden" name="filter_status" value="{filter_status}">
+                        <input type="hidden" name="q" value="{q}">
                         <button type="submit" class="btn-sm danger" title="Löschen & Blockieren">✕</button>
                     </form>
                 </div>
@@ -1194,7 +1318,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     saved_banner = '<div class="banner">✓ Einstellungen gespeichert!</div>' if settings == "saved" else ""
     folder_list_html = "".join(f"<li style='margin-bottom:6px;'><code>{f}</code></li>" for f in scanned_folders) or "<li>Bisher keine Bibliotheken erfasst. Klicke auf 'Mediathek scannen'!</li>"
 
-    # Button Beschriftungen für aktuellen Tab
     scope_label = "Filme" if current_scope == "Film" else ("Serien" if current_scope == "Serie" else "Collections")
 
     return f"""
@@ -1241,16 +1364,18 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }}
             th {{ background: #1f2329; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }}
             .meta {{ font-size: 0.75rem; color: #8b929a; }}
-            .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; display:inline-block; }}
             .badge.ok {{ background: var(--success-bg); color: var(--success-text); }}
             .badge.miss {{ background: var(--miss-bg); color: var(--miss-text); }}
+            .badge.active-dl {{ background: #1c3b66; color: #7db2ff; animation: pulse 1.2s infinite; }}
+            @keyframes pulse {{ 0% {{ opacity: 0.6; }} 50% {{ opacity: 1; }} 100% {{ opacity: 0.6; }} }}
             .inline-form {{ display: inline-flex; gap: 4px; }}
             audio {{ height: 32px; width: 190px; }}
             .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
             
             /* PROGRESS & QUEUE CARD */
-            .progress-card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 18px; }}
-            .progress-bar-bg {{ background: #262a32; height: 12px; border-radius: 6px; overflow: hidden; margin: 10px 0; }}
+            .progress-card {{ background: var(--card-bg); border: 1px solid #344256; border-radius: 8px; padding: 16px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+            .progress-bar-bg {{ background: #262a32; height: 14px; border-radius: 7px; overflow: hidden; margin: 10px 0; }}
             .progress-bar-fill {{ background: #28a745; height: 100%; width: 0%; transition: width 0.3s ease; }}
             .queue-box {{ background: #131519; border: 1px solid #232730; border-radius: 6px; padding: 10px; margin-top: 12px; font-size: 0.85rem; }}
             
@@ -1261,7 +1386,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             .tab-btn.active {{ background: #2b7de9; color: #fff; }}
             
             /* FILTER PILLS */
-            .pill-filter {{ display: flex; gap: 8px; align-items: center; }}
+            .pill-filter {{ display: flex; gap: 8px; align-items: center; flex-wrap:wrap; }}
             .pill {{ background: #20242b; color: var(--text-muted); border: 1px solid #2d323b; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; text-decoration: none; font-weight: 500; cursor: pointer; }}
             .pill:hover {{ color: #fff; border-color: #3f4552; }}
             .pill.active {{ background: #2b7de9; color: #fff; border-color: #2b7de9; }}
@@ -1290,21 +1415,30 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
 
-                <!-- GEZIELTER SCAN -->
+                <!-- GEZIELTER SCAN (BLEIBT IM REITER) -->
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
                     <button type="submit" title="Scannt nur die aktuelle Kategorie ({scope_label})">🔍 Nur {scope_label} scannen</button>
                 </form>
 
                 <!-- ALLES SCANNEN -->
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="all">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
                     <button type="submit" class="secondary" title="Kompletten Scan über alle Kategorien ausführen">🌐 Alles scannen</button>
                 </form>
 
-                <!-- GEZIELTER DOWNLOAD -->
+                <!-- GEZIELTER DOWNLOAD (BLEIBT IM REITER) -->
                 <form method="post" action="/download" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
+                    <input type="hidden" name="tab" value="{clean_tab}">
+                    <input type="hidden" name="filter_status" value="{filter_status}">
+                    <input type="hidden" name="q" value="{q}">
                     <button type="submit" class="success" title="Lädt fehlende Themes für {scope_label}">⬇️ {scope_label} laden ({tab_miss})</button>
                 </form>
 
@@ -1317,20 +1451,20 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         <!-- LIVE FORTSCHRITTS- & WARTESCHLANGEN-KARTE -->
         <div id="progressCard" class="progress-card" style="display:none;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-                <strong id="progStep">Aktion läuft...</strong>
-                <span id="progCount" style="color:var(--text-muted); font-size:0.9rem;">0 / 0</span>
+                <strong id="progStep" style="font-size:1.05rem;">Aktion läuft...</strong>
+                <span id="progCount" style="color:var(--text-muted); font-size:0.95rem; font-weight:600;">0 / 0</span>
             </div>
             <div class="progress-bar-bg">
                 <div id="progFill" class="progress-bar-fill"></div>
             </div>
             <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-muted);">
                 <span id="progItem">Verarbeite...</span>
-                <span>Erfolgreich: <strong id="progDown" style="color:#5ce69a;">0</strong> | Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
+                <span>Erfolgreich geladen: <strong id="progDown" style="color:#5ce69a;">0</strong> | Übersprungen/Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
             </div>
 
             <!-- AUSKLAPPBARE WARTESCHLANGE & VERLAUF -->
             <div id="queueBox" class="queue-box" style="display:none;">
-                <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">📋 Nächste in der Warteschlange:</div>
+                <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">📋 Nächste in der Download-Warteschlange:</div>
                 <div id="queueList" style="color:var(--text-muted); font-size:0.8rem; margin-bottom:10px;">-</div>
                 <div style="font-weight:600; margin-bottom:4px; color:#5ce69a;">✓ Zuletzt abgeschlossen:</div>
                 <div id="recentList" style="font-size:0.8rem;">-</div>
@@ -1350,7 +1484,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <div class="form-group" style="grid-column: 1 / -1;">
                         <label>Medienpfad(e) im Container</label>
                         <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media">
-                        <small style="color:var(--text-muted);">Standard: <code>/media</code>. Wird mit deinen Docker Compose Volumes verknüpft.</small>
+                        <small style="color:var(--text-muted);">Standard: <code>/media</code>. Entspricht deinem Festplatten-Mount.</small>
                         <div id="res_folder" class="test-result"></div>
                     </div>
                     <div class="checkbox-group">
@@ -1407,16 +1541,16 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </form>
         </div>
 
-        <!-- REITER / TABS -->
+        <!-- REITER / TABS (BLEIBEN BEI JEDER AKTION AKTIV) -->
         <div class="tab-nav">
-            <a href="/?tab=filme" class="tab-btn {'active' if tab=='filme' else ''}">🎬 Filme ({filme_ok}/{total_filme})</a>
-            <a href="/?tab=serien" class="tab-btn {'active' if tab=='serien' else ''}">📺 Serien ({serien_ok}/{total_serien})</a>
-            <a href="/?tab=collections" class="tab-btn {'active' if tab=='collections' else ''}">📁 Collections ({cols_ok}/{total_cols})</a>
-            <a href="/?tab=ordner" class="tab-btn {'active' if tab=='ordner' else ''}">📂 Eingelesene Mediatheken ({len(scanned_folders)})</a>
+            <a href="/?tab=filme&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='filme' else ''}">🎬 Filme ({filme_ok}/{total_filme})</a>
+            <a href="/?tab=serien&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='serien' else ''}">📺 Serien ({serien_ok}/{total_serien})</a>
+            <a href="/?tab=collections&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='collections' else ''}">📁 Collections ({cols_ok}/{total_cols})</a>
+            <a href="/?tab=ordner" class="tab-btn {'active' if clean_tab=='ordner' else ''}">📂 Eingelesene Mediatheken ({len(scanned_folders)})</a>
         </div>
 
-        {'<!-- ORDNER TAB -->' if tab == 'ordner' else ''}
-        <div style="display: {'block' if tab == 'ordner' else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
+        {'<!-- ORDNER TAB -->' if clean_tab == 'ordner' else ''}
+        <div style="display: {'block' if clean_tab == 'ordner' else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
             <h3 style="margin-top:0;">Gefundene Mediatheken & Verzeichnisse:</h3>
             <p style="color:var(--text-muted); font-size:0.9rem;">Hier siehst du alle Mediatheken und Pfade, die Jellyfin und deine Festplatte gemeldet haben:</p>
             <ul style="line-height:1.8; font-size:0.95rem;">
@@ -1425,24 +1559,24 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         </div>
 
         <!-- FILTER-LEISTE & TABELLE -->
-        <div style="display: {'none' if tab == 'ordner' else 'block'};">
+        <div style="display: {'none' if clean_tab == 'ordner' else 'block'};">
             <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px; display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
                 
-                <!-- KLARE PILL-FILTER (KEINE VERWIRRUNG MEHR) -->
+                <!-- KLARE FILTER-BUTTONS (PILLS) -->
                 <div class="pill-filter">
                     <span style="font-size:0.85rem; color:var(--text-muted); margin-right:4px;">Filter:</span>
-                    <a href="/?tab={tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">Alle ({tab_total})</a>
-                    <a href="/?tab={tab}&filter_status=missing{f'&q={q}' if q else ''}" class="pill miss {'active' if filter_status=='missing' else ''}">❌ Fehlt ({tab_miss})</a>
-                    <a href="/?tab={tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">✓ Vorhanden ({tab_ok})</a>
+                    <a href="/?tab={clean_tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">Alle ({tab_total})</a>
+                    <a href="/?tab={clean_tab}&filter_status=missing{f'&q={q}' if q else ''}" class="pill miss {'active' if filter_status=='missing' else ''}">❌ Fehlt ({tab_miss})</a>
+                    <a href="/?tab={clean_tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">✓ Vorhanden ({tab_ok})</a>
                 </div>
 
                 <!-- SUCHE -->
                 <form method="get" action="/" style="display:flex; gap:6px; align-items:center;">
-                    <input type="hidden" name="tab" value="{tab}">
+                    <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
                     <input type="text" name="q" value="{q}" placeholder="{scope_label} durchsuchen..." style="width:200px;">
                     <button type="submit" class="btn-sm">Suchen</button>
-                    {f'<a href="/?tab={tab}&filter_status={filter_status}" class="btn-sm secondary">✕</a>' if q else ''}
+                    {f'<a href="/?tab={clean_tab}&filter_status={filter_status}" class="btn-sm secondary">✕</a>' if q else ''}
                 </form>
             </div>
 
@@ -1484,12 +1618,20 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     if (data.is_running) {{
                         card.style.display = 'block';
                         cancelBtn.style.display = 'inline-flex';
-                        document.getElementById('progStep').innerText = data.current_step;
+                        document.getElementById('progStep').innerText = (data.action_type === 'download' ? '⬇️ ' : '🔍 ') + data.current_step;
                         document.getElementById('progCount').innerText = data.processed + ' / ' + data.total + ' (' + data.percent + '%)';
                         document.getElementById('progFill').style.width = data.percent + '%';
-                        document.getElementById('progItem').innerText = data.current_item || '';
+                        document.getElementById('progItem').innerText = data.current_item_title || '';
                         document.getElementById('progDown').innerText = data.new_downloaded;
                         document.getElementById('progFail').innerText = data.failed;
+
+                        // Zeige aktiven Downloadstatus in der jeweiligen Tabellenzeile
+                        if (data.current_item_id) {{
+                            const rowStatus = document.getElementById('status_box_' + data.current_item_id);
+                            if (rowStatus) {{
+                                rowStatus.innerHTML = '<span class="badge active-dl">⏳ Lade Theme...</span>';
+                            }}
+                        }}
 
                         if (data.action_type === 'download') {{
                             qBox.style.display = 'block';
@@ -1501,7 +1643,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
 
                             if (data.recent_finished && data.recent_finished.length > 0) {{
                                 document.getElementById('recentList').innerHTML = data.recent_finished.slice(0, 4).map(r => 
-                                    '<div style=\"color:' + (r.ok ? '#5ce69a' : '#ff8585') + ';\">' + (r.ok ? '✓ ' : '✕ ') + '<strong>' + r.title + '</strong>: ' + r.msg + '</div>'
+                                    '<div style=\"color:' + (r.ok ? '#5ce69a' : '#ff8585') + '; margin-bottom:2px;\">' + (r.ok ? '✓ ' : '✕ ') + '<strong>' + r.title + '</strong>: ' + r.msg + '</div>'
                                 ).join('');
                             }}
                         }} else {{
