@@ -12,30 +12,28 @@ from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import xml.etree.ElementTree as ET
 
-app = FastAPI(title="Theme Fetcher Alpha")
-
-# --- Konfiguration & Umgebungsvariablen ---
-JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").rstrip("/")
-JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
-JF_METADATA_DIR = os.getenv("JF_METADATA_DIR", "/jellyfin-metadata")
-
-PLEX_URL = os.getenv("PLEX_URL", "").rstrip("/")
-PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
-
-EMBY_URL = os.getenv("EMBY_URL", "").rstrip("/")
-EMBY_API_KEY = os.getenv("EMBY_API_KEY", "")
-
-LOCAL_SCAN_ENABLED = os.getenv("LOCAL_SCAN_ENABLED", "false").lower() in ("true", "1", "yes")
-LOCAL_MEDIA_DIR = Path(os.getenv("LOCAL_MEDIA_DIR", "/media"))
-
-MAX_DURATION = int(os.getenv("MAX_DURATION_SEC", "270"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_HOURS", "12"))
+app = FastAPI(title="Theme Fetcher")
 
 DATA_DIR = Path("/data")
 COLLECTIONS_DIR = DATA_DIR / "collections"
+CONFIG_FILE = DATA_DIR / "config.json"
+STATE_FILE = DATA_DIR / "state.json"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 COLLECTIONS_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "state.json"
+
+DEFAULT_CONFIG = {
+    "local_media_paths": os.getenv("LOCAL_MEDIA_DIR", "/media"),
+    "local_scan_enabled": os.getenv("LOCAL_SCAN_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "jellyfin_url": os.getenv("JELLYFIN_URL", "").rstrip("/"),
+    "jellyfin_api_key": os.getenv("JELLYFIN_API_KEY", ""),
+    "jf_metadata_dir": os.getenv("JF_METADATA_DIR", "/jellyfin-metadata"),
+    "plex_url": os.getenv("PLEX_URL", "").rstrip("/"),
+    "plex_token": os.getenv("PLEX_TOKEN", ""),
+    "max_duration_sec": int(os.getenv("MAX_DURATION_SEC", "270")),
+    "scan_interval_hours": int(os.getenv("SCAN_INTERVAL_HOURS", "12")),
+    "auto_download": True
+}
 
 EXCLUDE_KEYWORDS = [
     "cover", "remix", "reaction", "reaktion", "1 hour", "10 hours", "loop",
@@ -46,18 +44,23 @@ EXCLUDE_KEYWORDS = [
 
 state_lock = threading.Lock()
 is_scanning = False
+scan_status_msg = ""
 
 
-def slugify(text: str) -> str:
-    clean = re.sub(r"[^\w\s-]", "", str(text), flags=re.UNICODE).strip().lower()
-    return re.sub(r"[-\s]+", "_", clean) or "item"
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        try:
+            stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            cfg.update(stored)
+        except Exception as e:
+            print(f"[Config Warnung] {e}")
+    return cfg
 
 
-def parse_folder_name(name: str):
-    m = re.match(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)$", name.strip())
-    if m:
-        return m.group("title").strip(), m.group("year")
-    return name.strip(), None
+def save_config(cfg: dict):
+    with state_lock:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def load_state() -> dict:
@@ -74,25 +77,30 @@ def save_state(state: dict):
         STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def find_jellyfin_boxset_dir(title: str) -> Optional[Path]:
-    base = Path(JF_METADATA_DIR)
+def slugify(text: str) -> str:
+    clean = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
+    return re.sub(r"[-\s]+", "_", clean) or "collection"
+
+
+def find_jellyfin_boxset_dir(title: str, jf_meta_base: str) -> Optional[Path]:
+    base = Path(jf_meta_base)
     if not base.exists():
         return None
     target_slug = slugify(title)
     try:
         for p in base.rglob("*"):
             if p.is_dir() and slugify(p.name) == target_slug:
-                if any(k in str(p).lower() for k in ("boxset", "collection", "metadata")):
+                if any(x in str(p).lower() for x in ("boxset", "collection", "metadata")):
                     return p
     except Exception:
         pass
     return None
 
 
-def sync_collection_theme(item: dict, mp3_path: Path):
+def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
     if item.get("type") != "Collection" or not mp3_path.exists():
         return
-    jf_dir = find_jellyfin_boxset_dir(item["title"])
+    jf_dir = find_jellyfin_boxset_dir(item["title"], jf_meta_base)
     if jf_dir:
         try:
             shutil.copy2(mp3_path, jf_dir / "theme.mp3")
@@ -100,14 +108,81 @@ def sync_collection_theme(item: dict, mp3_path: Path):
             print(f"[Collection Sync Warnung] {e}")
 
 
-# --- 1. Jellyfin API ---
-def fetch_jellyfin_items() -> List[dict]:
-    if not JELLYFIN_URL or not JELLYFIN_API_KEY:
+def scan_local_folders(paths_str: str) -> List[dict]:
+    results = []
+    if not paths_str:
+        return results
+
+    paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
+    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
+
+    for base_str in paths:
+        base = Path(base_str)
+        if not base.exists() or not base.is_dir():
+            continue
+
+        try:
+            # Check 1 to 2 levels deep
+            for root, dirs, files in os.walk(base):
+                rpath = Path(root)
+                # Ignore system / internal folders
+                if rpath.name.startswith(".") or rpath.name.lower() in ("@eaDir", "$recycle.bin", "system volume information"):
+                    continue
+
+                # Don't go excessively deep
+                try:
+                    rel_parts = rpath.relative_to(base).parts
+                except ValueError:
+                    rel_parts = ()
+                if len(rel_parts) > 3:
+                    continue
+
+                # Check if this folder has video files or theme.mp3 or season folders
+                has_video = any(Path(f).suffix.lower() in video_exts for f in files)
+                has_theme = (rpath / "theme.mp3").exists()
+                has_seasons = any(re.search(r"season|staffel|specials", d, re.IGNORECASE) for d in dirs)
+
+                if has_video or has_theme or has_seasons:
+                    # Skip Season/Staffel subfolders itself
+                    if re.search(r"^(season|staffel|specials|\bS\d+)", rpath.name, re.IGNORECASE):
+                        continue
+
+                    # Extract title & year from folder name e.g. "Matrix (1999)"
+                    name = rpath.name
+                    year = None
+                    m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", name)
+                    if m:
+                        title = m.group(1).strip()
+                        year = m.group(2)
+                    else:
+                        title = re.sub(r"[\._]", " ", name).strip()
+
+                    # Determine type
+                    itype = "Serie" if has_seasons or any("s01" in f.lower() or "staffel" in f.lower() for f in files) else "Film"
+                    item_id = f"local_{abs(hash(str(rpath)))}"
+
+                    results.append({
+                        "id": item_id,
+                        "source": "Lokal",
+                        "type": itype,
+                        "title": title,
+                        "original_title": "",
+                        "year": year,
+                        "dir": str(rpath)
+                    })
+        except Exception as e:
+            print(f"[Lokaler Scan Fehler bei {base_str}] {e}")
+
+    return results
+
+
+def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
+    if not url or not api_key:
         return []
-    headers = {"X-Emby-Token": JELLYFIN_API_KEY}
+    headers = {"X-Emby-Token": api_key}
     results = []
     try:
-        users_resp = requests.get(f"{JELLYFIN_URL}/Users", headers=headers, timeout=10)
+        users_resp = requests.get(f"{url}/Users", headers=headers, timeout=10)
         users_resp.raise_for_status()
         users = users_resp.json()
         if not users:
@@ -119,7 +194,7 @@ def fetch_jellyfin_items() -> List[dict]:
             "Recursive": "true",
             "Fields": "Path,ProductionYear,OriginalTitle"
         }
-        resp = requests.get(f"{JELLYFIN_URL}/Users/{user_id}/Items", headers=headers, params=params, timeout=20)
+        resp = requests.get(f"{url}/Users/{user_id}/Items", headers=headers, params=params, timeout=20)
         resp.raise_for_status()
 
         for item in resp.json().get("Items", []):
@@ -160,14 +235,13 @@ def fetch_jellyfin_items() -> List[dict]:
     return results
 
 
-# --- 2. Plex API ---
-def fetch_plex_items() -> List[dict]:
-    if not PLEX_URL or not PLEX_TOKEN:
+def fetch_plex_items(url: str, token: str) -> List[dict]:
+    if not url or not token:
         return []
-    headers = {"X-Plex-Token": PLEX_TOKEN, "Accept": "application/xml"}
+    headers = {"X-Plex-Token": token, "Accept": "application/xml"}
     results = []
     try:
-        sec_resp = requests.get(f"{PLEX_URL}/library/sections", headers=headers, timeout=10)
+        sec_resp = requests.get(f"{url}/library/sections", headers=headers, timeout=10)
         sec_resp.raise_for_status()
         root = ET.fromstring(sec_resp.text)
 
@@ -177,7 +251,7 @@ def fetch_plex_items() -> List[dict]:
             if sec_type not in ("movie", "show"):
                 continue
 
-            items_resp = requests.get(f"{PLEX_URL}/library/sections/{sec_id}/all", headers=headers, timeout=20)
+            items_resp = requests.get(f"{url}/library/sections/{sec_id}/all", headers=headers, timeout=20)
             items_root = ET.fromstring(items_resp.text)
 
             if sec_type == "movie":
@@ -209,7 +283,7 @@ def fetch_plex_items() -> List[dict]:
                         })
 
             try:
-                col_resp = requests.get(f"{PLEX_URL}/library/sections/{sec_id}/collections", headers=headers, timeout=15)
+                col_resp = requests.get(f"{url}/library/sections/{sec_id}/collections", headers=headers, timeout=15)
                 col_root = ET.fromstring(col_resp.text)
                 for col in col_root.findall("Directory"):
                     rkey = col.attrib.get("ratingKey", "")
@@ -227,117 +301,13 @@ def fetch_plex_items() -> List[dict]:
                         "dir": str(cdir)
                     })
             except Exception as ce:
-                print(f"[Plex Collections Warnung Sektion {sec_id}] {ce}")
+                print(f"[Plex Collections Warnung] {ce}")
 
     except Exception as e:
         print(f"[Plex Fehler] {e}")
     return results
 
 
-# --- 3. Emby API ---
-def fetch_emby_items() -> List[dict]:
-    if not EMBY_URL or not EMBY_API_KEY:
-        return []
-    headers = {"X-Emby-Token": EMBY_API_KEY}
-    results = []
-    try:
-        users_resp = requests.get(f"{EMBY_URL}/Users", headers=headers, timeout=10)
-        users_resp.raise_for_status()
-        users = users_resp.json()
-        if not users:
-            return []
-        user_id = users[0]["Id"]
-
-        params = {
-            "IncludeItemTypes": "Movie,Series,BoxSet",
-            "Recursive": "true",
-            "Fields": "Path,ProductionYear,OriginalTitle"
-        }
-        resp = requests.get(f"{EMBY_URL}/Users/{user_id}/Items", headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-
-        for item in resp.json().get("Items", []):
-            item_type = item.get("Type")
-            title = item.get("Name", "Unbekannt")
-            item_id = f"emby_{item['Id']}"
-
-            if item_type == "BoxSet":
-                col_dir = COLLECTIONS_DIR / f"{item_id}_{slugify(title)}"
-                col_dir.mkdir(parents=True, exist_ok=True)
-                results.append({
-                    "id": item_id,
-                    "source": "Emby",
-                    "type": "Collection",
-                    "title": title,
-                    "original_title": item.get("OriginalTitle") or "",
-                    "year": item.get("ProductionYear"),
-                    "dir": str(col_dir)
-                })
-                continue
-
-            raw_path = item.get("Path")
-            if not raw_path:
-                continue
-            p = Path(raw_path)
-            target_dir = p.parent if item_type == "Movie" else p
-            results.append({
-                "id": item_id,
-                "source": "Emby",
-                "type": "Serie" if item_type == "Series" else "Film",
-                "title": title,
-                "original_title": item.get("OriginalTitle") or "",
-                "year": item.get("ProductionYear"),
-                "dir": str(target_dir)
-            })
-    except Exception as e:
-        print(f"[Emby Fehler] {e}")
-    return results
-
-
-# --- 4. Lokaler / Universeller Ordner-Scan (Kodi, Infuse, etc.) ---
-def fetch_local_items() -> List[dict]:
-    if not LOCAL_SCAN_ENABLED or not LOCAL_MEDIA_DIR.exists():
-        return []
-    results = []
-    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".iso"}
-    try:
-        for root, dirs, files in os.walk(LOCAL_MEDIA_DIR):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ("@eadir", "extrafanart", "sample", ".actors")]
-            p_root = Path(root)
-            if p_root == LOCAL_MEDIA_DIR:
-                continue
-
-            has_seasons = any(d.lower().startswith(("season", "staffel")) for d in dirs)
-            has_videos = any(Path(f).suffix.lower() in video_exts for f in files)
-
-            # Skip Sub-Season-Folders like "Season 1"
-            if p_root.name.lower().startswith(("season ", "staffel ", "season", "staffel")):
-                continue
-
-            is_serie = has_seasons or any(s in str(p_root).lower() for s in ("serie", "show"))
-            is_movie = has_videos and not has_seasons and any(m in str(p_root).lower() for m in ("film", "movie"))
-
-            if has_seasons or has_videos:
-                title, year = parse_folder_name(p_root.name)
-                mtype = "Serie" if is_serie else "Film"
-                rel_id = slugify(str(p_root.relative_to(LOCAL_MEDIA_DIR)))
-                results.append({
-                    "id": f"local_{rel_id}",
-                    "source": "Lokal",
-                    "type": mtype,
-                    "title": title,
-                    "original_title": "",
-                    "year": year,
-                    "dir": str(p_root)
-                })
-                if not has_seasons:
-                    dirs.clear()
-    except Exception as e:
-        print(f"[Lokaler Scan Fehler] {e}")
-    return results
-
-
-# --- Such- & Download-Logik ---
 def build_search_queries(item: dict) -> List[str]:
     title = item["title"].strip()
     orig = (item.get("original_title") or "").strip()
@@ -369,7 +339,7 @@ def build_search_queries(item: dict) -> List[str]:
     return queries
 
 
-def find_candidate(search_expr: str, blacklist: List[str]) -> Optional[dict]:
+def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> Optional[dict]:
     cmd = [
         "yt-dlp",
         search_expr,
@@ -377,34 +347,34 @@ def find_candidate(search_expr: str, blacklist: List[str]) -> Optional[dict]:
         "--flat-playlist",
         "--no-warnings"
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    for line in res.stdout.strip().splitlines():
-        if not line:
-            continue
-        try:
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        for line in res.stdout.strip().splitlines():
+            if not line:
+                continue
             entry = json.loads(line)
-        except Exception:
-            continue
-        vid_id = entry.get("id", "")
-        vid_title = entry.get("title", "")
-        duration = entry.get("duration") or 0
-        url = entry.get("url") or entry.get("webpage_url") or (
-            f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
-        )
-        lower_title = vid_title.lower()
+            vid_id = entry.get("id", "")
+            vid_title = entry.get("title", "")
+            duration = entry.get("duration") or 0
+            url = entry.get("url") or entry.get("webpage_url") or (
+                f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
+            )
+            lower_title = vid_title.lower()
 
-        if not url or vid_id in blacklist:
-            continue
-        if duration and duration > MAX_DURATION:
-            continue
-        if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
-            continue
+            if not url or vid_id in blacklist:
+                continue
+            if duration and duration > max_dur:
+                continue
+            if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
+                continue
 
-        return {"id": vid_id or url, "url": url, "title": vid_title}
+            return {"id": vid_id or url, "url": url, "title": vid_title}
+    except Exception as e:
+        print(f"[Such-Kandidat Fehler] {e}")
     return None
 
 
-def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None) -> dict:
+def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata") -> dict:
     blacklist = blacklist or []
     target_dir = Path(item["dir"])
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -431,14 +401,14 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         )
         try:
             for expr in search_list:
-                chosen_video = find_candidate(expr, blacklist)
+                chosen_video = find_candidate(expr, blacklist, max_dur)
                 if chosen_video:
                     break
         except Exception as e:
             return {"ok": False, "msg": f"Suchfehler: {e}"}
 
     if not chosen_video:
-        return {"ok": False, "msg": "Kein passender Treffer (DE/Orig/SC)"}
+        return {"ok": False, "msg": "Kein passender Treffer"}
 
     try:
         dl_cmd = [
@@ -455,7 +425,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             if output_mp3.exists():
                 output_mp3.unlink()
             downloaded.rename(output_mp3)
-            sync_collection_theme(item, output_mp3)
+            sync_collection_theme(item, output_mp3, jf_meta_base)
             return {
                 "ok": True,
                 "video_id": chosen_video["id"],
@@ -466,29 +436,30 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         return {"ok": False, "msg": f"Downloadfehler: {e}"}
 
 
-def run_full_scan(auto_download: bool = True):
-    global is_scanning
+def run_full_scan():
+    global is_scanning, scan_status_msg
     if is_scanning:
         return
     is_scanning = True
+    scan_status_msg = "Scan läuft..."
     try:
+        cfg = load_config()
         state = load_state()
-        raw_items = (
-            fetch_jellyfin_items() +
-            fetch_plex_items() +
-            fetch_emby_items() +
-            fetch_local_items()
-        )
+
+        raw_items = []
+        if cfg.get("local_scan_enabled", True):
+            raw_items.extend(scan_local_folders(cfg.get("local_media_paths", "/media")))
+
+        raw_items.extend(fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", "")))
+        raw_items.extend(fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", "")))
 
         by_dir = {}
         for it in raw_items:
-            norm_dir = str(Path(it["dir"]).resolve())
-            if norm_dir in by_dir:
-                # Prioritize dedicated server items over generic local crawler
-                if by_dir[norm_dir].get("source") == "Lokal" and it.get("source") != "Lokal":
-                    by_dir[norm_dir] = it
-            else:
-                by_dir[norm_dir] = it
+            by_dir[it["dir"]] = it
+
+        max_dur = cfg.get("max_duration_sec", 270)
+        auto_dl = cfg.get("auto_download", True)
+        jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
         for dir_path, it in by_dir.items():
             item_id = it["id"]
@@ -497,7 +468,7 @@ def run_full_scan(auto_download: bool = True):
             theme_exists = mp3_path.exists()
 
             if theme_exists and it.get("type") == "Collection":
-                sync_collection_theme(it, mp3_path)
+                sync_collection_theme(it, mp3_path, jf_meta)
 
             record = {
                 **it,
@@ -507,9 +478,9 @@ def run_full_scan(auto_download: bool = True):
                 "status": "Vorhanden" if theme_exists else existing.get("status", "Fehlt")
             }
 
-            if auto_download and not theme_exists:
+            if auto_dl and not theme_exists:
                 bl = state["blacklist"].get(item_id, [])
-                dl_res = search_and_download(it, blacklist=bl)
+                dl_res = search_and_download(it, blacklist=bl, max_dur=max_dur, jf_meta_base=jf_meta)
                 if dl_res["ok"]:
                     record["has_theme"] = True
                     record["video_id"] = dl_res["video_id"]
@@ -520,15 +491,22 @@ def run_full_scan(auto_download: bool = True):
 
             state["items"][item_id] = record
             save_state(state)
+        scan_status_msg = f"Fertig ({len(by_dir)} Medien erkannt)"
+    except Exception as e:
+        scan_status_msg = f"Fehler: {e}"
+        print(f"[Scan Fehler] {e}")
     finally:
         is_scanning = False
 
 
 def background_scheduler():
+    time.sleep(5)
+    run_full_scan()
     while True:
-        time.sleep(10)
-        run_full_scan(auto_download=True)
-        time.sleep(max(1, SCAN_INTERVAL) * 3600)
+        cfg = load_config()
+        interval = max(1, int(cfg.get("scan_interval_hours", 12)))
+        time.sleep(interval * 3600)
+        run_full_scan()
 
 
 threading.Thread(target=background_scheduler, daemon=True).start()
@@ -548,13 +526,42 @@ def stream_audio(item_id: str):
 
 @app.post("/scan")
 def trigger_scan():
-    threading.Thread(target=run_full_scan, kwargs={"auto_download": True}, daemon=True).start()
+    threading.Thread(target=run_full_scan, daemon=True).start()
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/settings")
+def update_settings(
+    local_media_paths: str = Form("/media"),
+    local_scan_enabled: Optional[str] = Form(None),
+    jellyfin_url: str = Form(""),
+    jellyfin_api_key: str = Form(""),
+    plex_url: str = Form(""),
+    plex_token: str = Form(""),
+    max_duration_sec: int = Form(270),
+    scan_interval_hours: int = Form(12),
+    auto_download: Optional[str] = Form(None)
+):
+    cfg = load_config()
+    cfg["local_media_paths"] = local_media_paths.strip()
+    cfg["local_scan_enabled"] = bool(local_scan_enabled)
+    cfg["jellyfin_url"] = jellyfin_url.strip().rstrip("/")
+    cfg["jellyfin_api_key"] = jellyfin_api_key.strip()
+    cfg["plex_url"] = plex_url.strip().rstrip("/")
+    cfg["plex_token"] = plex_token.strip()
+    cfg["max_duration_sec"] = max_duration_sec
+    cfg["scan_interval_hours"] = scan_interval_hours
+    cfg["auto_download"] = bool(auto_download)
+
+    save_config(cfg)
+    threading.Thread(target=run_full_scan, daemon=True).start()
+    return RedirectResponse("/?settings=saved", status_code=303)
 
 
 @app.post("/replace/{item_id}")
 def replace_theme(item_id: str, custom_input: str = Form("")):
     state = load_state()
+    cfg = load_config()
     item = state["items"].get(item_id)
     if not item:
         raise HTTPException(status_code=404)
@@ -568,7 +575,9 @@ def replace_theme(item_id: str, custom_input: str = Form("")):
     dl_res = search_and_download(
         item,
         custom_query_or_url=custom_input.strip() or None,
-        blacklist=state["blacklist"].get(item_id, [])
+        blacklist=state["blacklist"].get(item_id, []),
+        max_dur=cfg.get("max_duration_sec", 270),
+        jf_meta_base=cfg.get("jf_metadata_dir", "/jellyfin-metadata")
     )
     if dl_res["ok"]:
         item["has_theme"] = True
@@ -600,7 +609,8 @@ def delete_theme(item_id: str):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", filter_status: str = "all", filter_type: str = "all", filter_source: str = "all"):
+def index(q: str = "", filter_status: str = "all", filter_type: str = "all", settings: str = ""):
+    cfg = load_config()
     state = load_state()
     items = list(state["items"].values())
     items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
@@ -616,14 +626,10 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", fil
         items = [i for i in items if i.get("has_theme")]
     if filter_type != "all":
         items = [i for i in items if i.get("type") == filter_type]
-    if filter_source != "all":
-        items = [i for i in items if i.get("source") == filter_source]
 
     total = len(state["items"])
     present = sum(1 for i in state["items"].values() if i.get("has_theme"))
     col_count = sum(1 for i in state["items"].values() if i.get("type") == "Collection")
-
-    sources = sorted(list({i.get("source", "Unbekannt") for i in state["items"].values()}))
 
     rows = ""
     for it in items:
@@ -646,26 +652,24 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", fil
         rows += f"""
         <tr>
             <td><strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
-                <span class="meta">{it['type']} • <span class="src-tag">{it['source']}</span> • {it.get('video_title') or it.get('status')}</span>
+                <span class="meta">{it['type']} • {it['source']} • {it.get('video_title') or it.get('status')}</span>
             </td>
             <td>{badge}</td>
             <td>{player}</td>
             <td>
                 <form method="post" action="/replace/{iid}" class="inline-form">
-                    <input type="text" name="custom_input" placeholder="Leer = nächster Treffer / Suchbegriff / URL">
+                    <input type="text" name="custom_input" placeholder="Leer = Treffer / Suchbegriff / URL">
                     <button type="submit">Laden / Neu</button>
                 </form>
                 <form method="post" action="/delete/{iid}" style="display:inline;">
-                    <button type="submit" class="danger" title="Löschen & Track blockieren">✕</button>
+                    <button type="submit" class="danger">✕</button>
                 </form>
             </td>
         </tr>
         """
 
-    source_options = '<option value="all">Alle Quellen</option>'
-    for s in ("Jellyfin", "Plex", "Emby", "Lokal"):
-        sel = 'selected' if filter_source == s else ''
-        source_options += f'<option value="{s}" {sel}>{s}</option>'
+    saved_banner = '<div class="banner">✓ Einstellungen gespeichert & Scan gestartet!</div>' if settings == "saved" else ""
+    scan_info = f" • ⏳ {scan_status_msg}" if is_scanning else (f" • {scan_status_msg}" if scan_status_msg else "")
 
     return f"""
     <!doctype html>
@@ -673,60 +677,152 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", fil
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Theme Fetcher Alpha</title>
+        <title>Theme Fetcher</title>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #121417; color: #e4e6eb; margin: 0; padding: 24px; }}
-            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }}
-            h1 {{ margin: 0; font-size: 1.5rem; letter-spacing: -0.5px; }}
-            .stats {{ color: #9aa0a6; font-size: 0.95rem; margin-top: 4px; }}
-            button {{ background: #2b7de9; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; transition: background 0.2s; }}
-            button:hover {{ background: #1b66c9; }}
-            button.danger {{ background: #c93b3b; padding: 8px 10px; }}
-            button.danger:hover {{ background: #a32a2a; }}
-            input[type="text"], select {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 7px 10px; border-radius: 6px; outline: none; }}
-            input[type="text"]:focus, select:focus {{ border-color: #2b7de9; }}
-            table {{ width: 100%; border-collapse: collapse; background: #181b20; border-radius: 8px; overflow: hidden; }}
-            th, td {{ padding: 12px 14px; border-bottom: 1px solid #262a32; text-align: left; vertical-align: middle; }}
-            th {{ background: #1f2329; font-size: 0.85rem; text-transform: uppercase; color: #9aa0a6; }}
+            :root {{
+                --bg: #121417;
+                --card-bg: #181b20;
+                --border: #262a32;
+                --text: #e4e6eb;
+                --text-muted: #9aa0a6;
+                --primary: #2b7de9;
+                --primary-hover: #1b66c9;
+                --danger: #c93b3b;
+                --success-bg: #1d4d32;
+                --success-text: #5ce69a;
+                --miss-bg: #4d2323;
+                --miss-text: #ff7b7b;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 14px; }}
+            h1 {{ margin: 0; font-size: 1.6rem; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }}
+            .stats {{ color: var(--text-muted); font-size: 0.95rem; margin-top: 4px; }}
+            button, .btn {{ background: var(--primary); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.9rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }}
+            button:hover, .btn:hover {{ background: var(--primary-hover); }}
+            button.secondary {{ background: #2a2e36; color: var(--text); }}
+            button.secondary:hover {{ background: #353b45; }}
+            button.danger {{ background: var(--danger); padding: 8px 10px; }}
+            input[type="text"], input[type="number"], select {{ background: #1e2126; border: 1px solid #343840; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; }}
+            input[type="text"]:focus, select:focus {{ outline: none; border-color: var(--primary); }}
+            table {{ width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; margin-top: 10px; }}
+            th, td {{ padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }}
+            th {{ background: #1f2329; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }}
             .meta {{ font-size: 0.8rem; color: #8b929a; }}
-            .src-tag {{ background: #2b303a; color: #79a8f5; padding: 2px 6px; border-radius: 4px; font-weight: 600; font-size: 0.75rem; }}
-            .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }}
-            .badge.ok {{ background: #1d4d32; color: #5ce69a; }}
-            .badge.miss {{ background: #4d2323; color: #ff7b7b; }}
+            .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .badge.ok {{ background: var(--success-bg); color: var(--success-text); }}
+            .badge.miss {{ background: var(--miss-bg); color: var(--miss-text); }}
             .inline-form {{ display: inline-flex; gap: 6px; }}
             audio {{ height: 32px; width: 220px; }}
+            .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
+            
+            /* Modal / Settings Panel */
+            .settings-panel {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
+            .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 14px; }}
+            .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
+            .form-group label {{ font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }}
+            .checkbox-group {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
+            .checkbox-group input {{ width: 18px; height: 18px; cursor: pointer; }}
+            .section-title {{ font-size: 1rem; font-weight: 700; margin-top: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
         </style>
     </head>
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; vertical-align:middle; background:#343840; padding:2px 8px; border-radius:10px;">Alpha</span></h1>
-                <div class="stats">{present} von {total} Themes vorhanden ({col_count} Collections) {'• ⏳ Scan läuft...' if is_scanning else ''}</div>
+                <h1>🎵 Theme Fetcher</h1>
+                <div class="stats">{present} von {total} Themes vorhanden ({col_count} Collections){scan_info}</div>
             </div>
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <form method="get" action="/" style="display:flex; gap:8px; flex-wrap:wrap;">
-                    <input type="text" name="q" value="{q}" placeholder="Titel / Originaltitel...">
-                    <select name="filter_source" onchange="this.form.submit()">
-                        {source_options}
-                    </select>
-                    <select name="filter_type" onchange="this.form.submit()">
-                        <option value="all" {'selected' if filter_type=='all' else ''}>Alle Typen</option>
-                        <option value="Film" {'selected' if filter_type=='Film' else ''}>Filme</option>
-                        <option value="Serie" {'selected' if filter_type=='Serie' else ''}>Serien</option>
-                        <option value="Collection" {'selected' if filter_type=='Collection' else ''}>Collections</option>
-                    </select>
-                    <select name="filter_status" onchange="this.form.submit()">
-                        <option value="all" {'selected' if filter_status=='all' else ''}>Alle Status</option>
-                        <option value="missing" {'selected' if filter_status=='missing' else ''}>Nur Fehlende</option>
-                        <option value="ok" {'selected' if filter_status=='ok' else ''}>Nur Vorhandene</option>
-                    </select>
-                    <button type="submit">Filtern</button>
-                </form>
+                <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
                 <form method="post" action="/scan">
                     <button type="submit">🔄 Jetzt scannen</button>
                 </form>
             </div>
         </div>
+
+        {saved_banner}
+
+        <!-- EINSTELLUNGEN PANEL -->
+        <div id="settingsBox" class="settings-panel" style="display: {'block' if settings == 'open' else 'none'};">
+            <h2 style="margin: 0 0 10px 0; font-size: 1.2rem;">⚙️ Einstellungen & Quellen</h2>
+            <form method="post" action="/settings">
+                <div class="section-title">📁 1. Lokale Medienquellen (Festplatte)</div>
+                <div class="settings-grid">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>Medienpfad(e) im Container</label>
+                        <input type="text" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}" placeholder="/media oder /media/ZimaOS-HDD">
+                        <small style="color:var(--text-muted);">Standard ist <code>/media</code>. Mehrere Pfade können mit Komma getrennt werden.</small>
+                    </div>
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
+                        <label for="local_scan_enabled">Lokalen Festplatten-Scan aktivieren</label>
+                    </div>
+                </div>
+
+                <div class="section-title" style="margin-top:20px;">🎬 2. Medienserver (Optional)</div>
+                <div class="settings-grid">
+                    <div class="form-group">
+                        <label>Jellyfin Server-URL</label>
+                        <input type="text" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}" placeholder="http://192.168.178.X:8096">
+                    </div>
+                    <div class="form-group">
+                        <label>Jellyfin API-Key</label>
+                        <input type="text" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}" placeholder="API-Key aus Jellyfin">
+                    </div>
+                    <div class="form-group">
+                        <label>Plex Server-URL</label>
+                        <input type="text" name="plex_url" value="{cfg.get('plex_url', '')}" placeholder="http://192.168.178.X:32400">
+                    </div>
+                    <div class="form-group">
+                        <label>Plex Token</label>
+                        <input type="text" name="plex_token" value="{cfg.get('plex_token', '')}" placeholder="X-Plex-Token">
+                    </div>
+                </div>
+
+                <div class="section-title" style="margin-top:20px;">⚡ 3. Download & Automatisierung</div>
+                <div class="settings-grid">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="auto_download" name="auto_download" {'checked' if cfg.get('auto_download', True) else ''}>
+                        <label for="auto_download">Automatisch nach fehlenden Themes suchen & laden</label>
+                    </div>
+                    <div class="form-group">
+                        <label>Max. Titellänge (Sekunden)</label>
+                        <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
+                    </div>
+                    <div class="form-group">
+                        <label>Scan-Intervall (Stunden)</label>
+                        <input type="number" name="scan_interval_hours" value="{cfg.get('scan_interval_hours', 12)}">
+                    </div>
+                </div>
+
+                <div style="margin-top:20px; display:flex; gap:10px;">
+                    <button type="submit" style="background:#28a745; font-size:1rem; padding:10px 20px;">💾 Einstellungen speichern & Neu scannen</button>
+                    <button type="button" class="secondary" onclick="toggleSettings()">Schließen</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- FILTER & SUCHE -->
+        <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px;">
+            <form method="get" action="/" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <input type="text" name="q" value="{q}" placeholder="Titel / Originaltitel suchen..." style="flex:1; min-width:200px;">
+                <select name="filter_type" onchange="this.form.submit()">
+                    <option value="all" {'selected' if filter_type=='all' else ''}>Alle Typen</option>
+                    <option value="Film" {'selected' if filter_type=='Film' else ''}>Filme</option>
+                    <option value="Serie" {'selected' if filter_type=='Serie' else ''}>Serien</option>
+                    <option value="Collection" {'selected' if filter_type=='Collection' else ''}>Collections</option>
+                </select>
+                <select name="filter_status" onchange="this.form.submit()">
+                    <option value="all" {'selected' if filter_status=='all' else ''}>Alle Status</option>
+                    <option value="missing" {'selected' if filter_status=='missing' else ''}>Nur Fehlende</option>
+                    <option value="ok" {'selected' if filter_status=='ok' else ''}>Nur Vorhandene</option>
+                </select>
+                <button type="submit">Filtern</button>
+                {f'<a href="/" class="btn secondary">Filter zurücksetzen</a>' if (q or filter_status!='all' or filter_type!='all') else ''}
+            </form>
+        </div>
+
+        <!-- TABELLE -->
         <table>
             <thead>
                 <tr>
@@ -736,8 +832,15 @@ def index(q: str = "", filter_status: str = "all", filter_type: str = "all", fil
                     <th>Aktion (Nächster Treffer / Suchbegriff / URL)</th>
                 </tr>
             </thead>
-            <tbody>{rows or '<tr><td colspan="4">Keine Medienelemente gefunden. Bitte Verbindungsdaten oder Dateipfade prüfen.</td></tr>'}</tbody>
+            <tbody>{rows or '<tr><td colspan="4" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge gefunden. Klicke oben auf ⚙️ Einstellungen, um deinen Medienordner anzugeben.</td></tr>'}</tbody>
         </table>
+
+        <script>
+            function toggleSettings() {{
+                const el = document.getElementById('settingsBox');
+                el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
+            }}
+        </script>
     </body>
     </html>
     """
