@@ -11,7 +11,10 @@ from typing import List, Optional, Tuple, Dict
 from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 app = FastAPI(title="Theme Fetcher")
 
@@ -416,14 +419,15 @@ def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
         if title_slug and title_slug in slugify(fname):
             return f
 
-    # 2. Metadaten-Check mit Pillow: Plakate sind Hochformat (Höhe > Breite)
+    # 2. Metadaten-Check: Plakate sind Hochformat (Höhe > Breite)
     portraits = []
     for f in candidates:
         try:
-            with Image.open(f) as img:
-                w, h = img.size
-                if h > w and (h / max(1, w)) >= 1.15:
-                    portraits.append((h / w, f))
+            if Image:
+                with Image.open(f) as img:
+                    w, h = img.size
+                    if h > w and (h / max(1, w)) >= 1.15:
+                        portraits.append((h / w, f))
         except Exception:
             pass
 
