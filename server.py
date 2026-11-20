@@ -12,7 +12,7 @@ from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Theme Fetcher")
+app = FastAPI(title="Theme Fetcher & Media Enricher")
 
 DATA_DIR = Path("/data")
 COLLECTIONS_DIR = DATA_DIR / "collections"
@@ -40,7 +40,6 @@ DEFAULT_CONFIG = {
     "auto_download": False
 }
 
-# STRIKTE FILTER: Verhindert Trailer, Szenen, Dialoge und Amateur-Müll
 EXCLUDE_KEYWORDS = [
     "scene", "szene", "clip", "movieclip", "movie clip", "dialog", "dialogue",
     "teaser", "trailer", "ausschnitt", "interview", "making of", "featurette",
@@ -52,7 +51,7 @@ EXCLUDE_KEYWORDS = [
     "ending scene", "death scene"
 ]
 
-THEME_REGEX = re.compile(r"^themes?\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
+THEME_REGEX = re.compile(r".*themes?.*\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
 
 state_lock = threading.Lock()
 stop_requested = False
@@ -63,6 +62,7 @@ scan_progress = {
     "current_step": "Bereit",
     "current_item_id": "",
     "current_item_title": "",
+    "item_status": {},  # item_id -> {"status": str, "percent": int, "step": str}
     "processed": 0,
     "total": 0,
     "percent": 0,
@@ -74,7 +74,6 @@ scan_progress = {
 
 
 def clean_url_input(val: str) -> str:
-    """Sorgt dafür, dass IPs ohne http:// automatisch mit http:// versehen werden"""
     val = (val or "").strip().rstrip("/")
     if not val:
         return ""
@@ -130,13 +129,15 @@ def normalize_tab(tab_name: str) -> str:
 
 
 def find_theme_file_in_dir(d: Path) -> Optional[Path]:
-    """Findet jede Theme-Datei unabhängig von Groß-/Kleinschreibung und Plural (theme.mp3, themes.mp3 etc.)"""
+    """Findet tolerant jede Theme-Audiodatei im Ordner oder in Staffel-Unterordnern"""
     if not d.exists() or not d.is_dir():
         return None
     try:
+        # 1. Direkte Suche im Hauptordner
         for f in d.iterdir():
             if f.is_file() and THEME_REGEX.match(f.name):
                 return f
+        # 2. Suche in Season/Staffel-Unterordnern
         for sub in d.iterdir():
             if sub.is_dir() and re.search(r"season|staffel|\bs\d+", sub.name, re.IGNORECASE):
                 for sf in sub.iterdir():
@@ -188,7 +189,7 @@ def resolve_media_path(raw_path_str: str) -> Path:
             for d in dirs:
                 if d.lower() == target_name:
                     return Path(root) / d
-            if len(Path(root).relative_to(media_base).parts) >= 2:
+            if len(Path(root).relative_to(media_base).parts) >= 3:
                 dirs.clear()
     except Exception:
         pass
@@ -197,7 +198,7 @@ def resolve_media_path(raw_path_str: str) -> Path:
 
 
 def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
-    """Tiefensuche: Findet theme.mp3 auch bei abweichenden Mount-Pfaden und Unterordnern"""
+    """Tiefensuche: Findet theme.mp3 auch bei abweichenden Mount-Pfaden und korrigiert it['dir'] dauerhaft"""
     existing = existing or {}
     candidates = []
 
@@ -237,28 +238,30 @@ def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, s
                         pass
             return True, d_str, theme_file
 
-    # Robuste Tiefensuche im gesamten /media Mount nach Ordner mit dem Serientitel/Filmtitel
+    # Robuste Rekursive Suche im gesamten /media Mount nach passendem Ordnernamen (z. B. Die Dinos)
     title_raw = it.get("title", "").strip().lower()
     title_slug = slugify(title_raw)
     media_base = Path("/media")
-    if media_base.exists() and len(title_slug) >= 3:
+    if media_base.exists() and len(title_slug) >= 2:
         try:
             for root, dirs, _ in os.walk(media_base):
                 for d in dirs:
                     d_lower = d.lower()
-                    if d_lower == title_raw or slugify(d) == title_slug or title_slug in slugify(d):
+                    d_slug = slugify(d)
+                    if d_lower == title_raw or d_slug == title_slug or (len(title_slug) > 4 and (title_slug in d_slug or d_slug in title_slug)):
                         cand_dir = Path(root) / d
                         theme_file = find_theme_file_in_dir(cand_dir)
                         if theme_file:
+                            it["dir"] = str(cand_dir)
                             return True, str(cand_dir), theme_file
-                        # Falls Verzeichnis existiert, aber noch kein Theme hat: Pfad trotzdem korrigieren
+                        # Falls Ordner existiert, aber noch kein Theme hat: Pfad trotzdem auf realen Mount umbiegen!
                         it["dir"] = str(cand_dir)
-                if len(Path(root).relative_to(media_base).parts) >= 3:
+                if len(Path(root).relative_to(media_base).parts) >= 4:
                     dirs.clear()
         except Exception:
             pass
 
-    default_dir = str(candidates[0]) if candidates else (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")
+    default_dir = str(it.get("dir") or (candidates[0] if candidates else (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")))
     return False, default_dir, None
 
 
@@ -288,13 +291,13 @@ def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
             print(f"[Collection Sync Warnung] {e}")
 
 
-def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclude_dirs: set = None) -> tuple[List[dict], List[str]]:
+def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclude_slugs: set = None) -> tuple[List[dict], List[str]]:
     results = []
     scanned_dirs = []
     if not paths_str:
         return results, scanned_dirs
 
-    exclude_dirs = exclude_dirs or set()
+    exclude_slugs = exclude_slugs or set()
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
 
@@ -313,10 +316,6 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
 
                 rpath = Path(root)
                 if rpath.name.startswith(".") or rpath.name.lower() in ("@eadir", "$recycle.bin", "system volume information"):
-                    continue
-
-                # DEDUPLIZIERUNG: Wenn dieser Ordner bereits von Jellyfin erfasst wurde -> Überspringen!
-                if str(rpath) in exclude_dirs:
                     continue
 
                 try:
@@ -347,6 +346,12 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
                     if filter_type and itype != filter_type:
                         continue
 
+                    # TITEL- & JAHRES-BASIERTE DEDUPLIZIERUNG GEGEN JELLYFIN/PLEX
+                    item_slug = f"{slugify(title)}_{year or ''}"
+                    alt_slug = slugify(title)
+                    if item_slug in exclude_slugs or alt_slug in exclude_slugs or str(rpath) in exclude_slugs:
+                        continue
+
                     item_id = f"local_{abs(hash(str(rpath)))}"
 
                     results.append({
@@ -369,7 +374,7 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.0.0"',
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.2.0"',
         "Accept": "application/json"
     }
 
@@ -638,7 +643,6 @@ def fetch_plex_items(url: str, token: str, filter_type: Optional[str] = None) ->
 
 
 def build_search_queries(item: dict) -> List[str]:
-    """Exakte Suchanfragen für REINE Musik ohne Trailer oder Gerede"""
     title = item["title"].strip()
     orig = (item.get("original_title") or "").strip()
     year = item.get("year")
@@ -646,32 +650,32 @@ def build_search_queries(item: dict) -> List[str]:
     queries = []
 
     if itype == "Serie":
-        queries.append(f"ytsearch6:{title} Opening Theme Song Soundtrack")
-        queries.append(f"ytsearch5:{title} Titelmelodie Instrumental")
+        queries.append(f"ytsearch8:{title} Opening Theme Song Soundtrack")
+        queries.append(f"ytsearch6:{title} Titelmelodie Instrumental")
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} TV Theme Song Audio")
-            queries.append(f"ytsearch5:{orig} Opening Credits Soundtrack")
+            queries.append(f"ytsearch8:{orig} TV Theme Song Audio")
+            queries.append(f"ytsearch6:{orig} Opening Credits Soundtrack")
     elif itype == "Collection":
-        queries.append(f"ytsearch6:{title} Soundtrack Main Theme")
+        queries.append(f"ytsearch8:{title} Soundtrack Main Theme")
         clean_col = re.sub(r"\b(collection|reihe|sammlung|filmreihe)\b", "", title, flags=re.IGNORECASE).strip()
         if clean_col and clean_col.lower() != title.lower():
-            queries.append(f"ytsearch6:{clean_col} Main Theme Soundtrack")
+            queries.append(f"ytsearch8:{clean_col} Main Theme Soundtrack")
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} Main Theme Score")
+            queries.append(f"ytsearch8:{orig} Main Theme Score")
     else:
-        # Filme: Fokus auf 'Soundtrack Main Title' oder 'Official Audio Theme'
         if orig and orig.lower() != title.lower():
-            queries.append(f"ytsearch6:{orig} {year or ''} Soundtrack Main Title".strip())
-            queries.append(f"ytsearch5:{orig} Official Audio Theme")
-        queries.append(f"ytsearch6:{title} {year or ''} Soundtrack Main Title".strip())
-        queries.append(f"ytsearch5:{title} Titelmusik Instrumental")
+            queries.append(f"ytsearch8:{orig} {year or ''} Soundtrack Main Title".strip())
+            queries.append(f"ytsearch6:{orig} Official Audio Theme")
+        queries.append(f"ytsearch8:{title} {year or ''} Soundtrack Main Title".strip())
+        queries.append(f"ytsearch6:{title} Titelmusik Instrumental")
 
     base_name = orig if orig else title
-    queries.append(f"scsearch5:{base_name} Main Theme Soundtrack")
+    queries.append(f"scsearch6:{base_name} Main Theme Soundtrack")
     return queries
 
 
-def find_candidate(search_expr: str, blacklist: List[str], min_dur: int, max_dur: int) -> tuple[Optional[dict], str]:
+def find_all_candidates(search_expr: str, blacklist: List[str], min_dur: int, max_dur: int) -> List[dict]:
+    """Liefert ALLE passenden Kandidaten einer Suche, um gesperrte Videos automatisch zu überspringen"""
     cmd = [
         "yt-dlp",
         search_expr,
@@ -679,12 +683,10 @@ def find_candidate(search_expr: str, blacklist: List[str], min_dur: int, max_dur
         "--flat-playlist",
         "--no-warnings"
     ]
+    candidates = []
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         lines = res.stdout.strip().splitlines()
-        if not lines:
-            return None, "Keine Suchergebnisse gefunden"
-
         for line in lines:
             if not line:
                 continue
@@ -704,24 +706,18 @@ def find_candidate(search_expr: str, blacklist: List[str], min_dur: int, max_dur
                 continue
             if duration and (duration < min_dur or duration > max_dur):
                 continue
-
-            # Harter Ausschluss: Keine Trailer, keine Szenen, kein Gerede
             if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
                 continue
 
-            return {"id": vid_id or url, "url": url, "title": vid_title, "duration": duration}, "OK"
-        return None, "Kein Treffer: Suchergebnisse enthielten Trailer/Szenen oder überschritten die Laufzeit"
-    except subprocess.TimeoutExpired:
-        return None, "Such-Timeout"
-    except Exception as e:
-        return None, f"Suchfehler: {str(e)}"
+            candidates.append({"id": vid_id or url, "url": url, "title": vid_title, "duration": duration})
+    except Exception:
+        pass
+    return candidates
 
 
 def post_process_audio(input_file: Path, output_file: Path, duration: int, fade: bool = True, cover_path: Optional[Path] = None):
-    """Wendet sanftes Audio-Fade-In/-Out an und bettet optional das Cover-Bild ein"""
     temp_processed = input_file.parent / f"processed_{input_file.name}"
     
-    # Audio-Filter: 1.5s Fade-In, 3s Fade-Out
     af_filter = []
     if fade:
         af_filter.append("afade=t=in:ss=0:d=1.5")
@@ -730,7 +726,6 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
             af_filter.append(f"afade=t=out:st={out_start}:d=3.0")
 
     af_arg = ",".join(af_filter) if af_filter else "anull"
-
     cmd = ["ffmpeg", "-y", "-i", str(input_file)]
     
     if cover_path and cover_path.exists():
@@ -751,7 +746,6 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
     except Exception as e:
         print(f"[FFmpeg Filter Warnung] {e}")
 
-    # Fallback
     if input_file.exists():
         if output_file.exists():
             output_file.unlink()
@@ -759,7 +753,35 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
     return True
 
 
+def save_poster_to_disk(item: dict) -> bool:
+    """TMM-Feature: Lädt das Poster herunter und speichert es als poster.jpg im Medienordner"""
+    target_dir = Path(item.get("dir", ""))
+    if not target_dir.exists() or not target_dir.is_dir():
+        return False
+
+    poster_file = target_dir / "poster.jpg"
+    if poster_file.exists():
+        return True
+
+    cfg = load_config()
+    if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
+        jf_url = cfg["jellyfin_url"]
+        raw_id = item["jf_raw_id"]
+        api_key = cfg.get("jellyfin_api_key", "").strip()
+        headers = get_jellyfin_headers(api_key)
+        try:
+            r = requests.get(f"{jf_url}/Items/{raw_id}/Images/Primary", headers=headers, timeout=8)
+            if r.status_code == 200 and len(r.content) > 1024:
+                poster_file.write_bytes(r.content)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
+    global scan_progress
+    item_id = item["id"]
     blacklist = blacklist or []
     target_dir = Path(item["dir"])
 
@@ -769,7 +791,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         test_write.write_text("ok")
         test_write.unlink()
     except Exception:
-        safe_fallback = LOCAL_THEMES_DIR / item["id"]
+        safe_fallback = LOCAL_THEMES_DIR / item_id
         safe_fallback.mkdir(parents=True, exist_ok=True)
         target_dir = safe_fallback
         item["dir"] = str(safe_fallback)
@@ -784,32 +806,36 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         custom_query_or_url.startswith("http://") or custom_query_or_url.startswith("https://")
     )
 
-    chosen_video = None
-    search_reason = ""
-
+    candidates = []
     if is_direct_url:
-        chosen_video = {"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}
+        candidates = [{"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}]
     else:
+        scan_progress["item_status"][item_id] = {"status": "searching", "percent": 20, "step": "Suche Soundtrack..."}
         search_list = (
-            [f"ytsearch8:{custom_query_or_url}", f"scsearch5:{custom_query_or_url}"]
+            [f"ytsearch8:{custom_query_or_url}", f"scsearch6:{custom_query_or_url}"]
             if custom_query_or_url
             else build_search_queries(item)
         )
-        try:
-            for expr in search_list:
-                cand, reason = find_candidate(expr, blacklist, min_dur, max_dur)
-                if cand:
-                    chosen_video = cand
+        for expr in search_list:
+            cands = find_all_candidates(expr, blacklist, min_dur, max_dur)
+            if cands:
+                candidates.extend(cands)
+                if len(candidates) >= 5:
                     break
-                else:
-                    search_reason = reason
-        except Exception as e:
-            return {"ok": False, "msg": f"Suchfehler: {e}"}
 
-    if not chosen_video:
-        return {"ok": False, "msg": f"Kein Treffer: {search_reason or 'Suche erfolglos'}"}
+    if not candidates:
+        scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": "Kein Soundtrack gefunden"}
+        return {"ok": False, "msg": "Keine reine Titelmusik gefunden (nur Trailer/Szenen oder keine Treffer)"}
 
-    try:
+    # MULTI-KANDIDATEN-FALLBACK: Wenn Video gesperrt/gelöscht ist -> Nächstes probieren!
+    last_err = ""
+    for idx, chosen_video in enumerate(candidates, 1):
+        scan_progress["item_status"][item_id] = {
+            "status": "downloading",
+            "percent": int(30 + (idx / len(candidates)) * 40),
+            "step": f"Lade ({idx}/{len(candidates)}): {chosen_video['title'][:35]}..."
+        }
+
         dl_cmd = [
             "yt-dlp",
             "-x",
@@ -819,33 +845,37 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             "-o", temp_template,
             chosen_video["url"]
         ]
-        res = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
-        if res.returncode != 0:
-            err_msg = res.stderr.strip().splitlines()[-1] if res.stderr else "Fehlercode 1"
-            return {"ok": False, "msg": f"Downloadfehler ({err_msg[:80]})"}
+        try:
+            res = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
+            if res.returncode != 0:
+                err_line = res.stderr.strip().splitlines()[-1] if res.stderr else "Fehler"
+                last_err = err_line[:80]
+                blacklist.append(chosen_video["id"])
+                continue
 
-        downloaded = target_dir / "theme_temp.mp3"
-        if downloaded.exists():
-            # Lokales Cover suchen
-            cover_file = None
-            for fname in ("poster.jpg", "folder.jpg", "cover.jpg"):
-                c_cand = target_dir / fname
-                if c_cand.exists():
-                    cover_file = c_cand
-                    break
+            downloaded = target_dir / "theme_temp.mp3"
+            if downloaded.exists() and downloaded.stat().st_size > 1024:
+                scan_progress["item_status"][item_id] = {"status": "processing", "percent": 85, "step": "Schneide Audio (Fade-In/Out)..."}
 
-            # Audio filtern (Fade-In/Out) & ggf. Cover einbetten
-            post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade, cover_path=cover_file)
-            sync_collection_theme(item, output_mp3, jf_meta_base)
+                # TMM: Poster sicherstellen und in MP3 einbetten
+                save_poster_to_disk(item)
+                cover_file = target_dir / "poster.jpg" if (target_dir / "poster.jpg").exists() else None
 
-            return {
-                "ok": True,
-                "video_id": chosen_video["id"],
-                "video_title": chosen_video["title"]
-            }
-        return {"ok": False, "msg": "MP3-Konvertierung fehlgeschlagen"}
-    except Exception as e:
-        return {"ok": False, "msg": f"Downloadfehler: {str(e)[:60]}"}
+                post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade, cover_path=cover_file)
+                sync_collection_theme(item, output_mp3, jf_meta_base)
+
+                scan_progress["item_status"][item_id] = {"status": "done", "percent": 100, "step": "Erfolgreich geladen!"}
+                return {
+                    "ok": True,
+                    "video_id": chosen_video["id"],
+                    "video_title": chosen_video["title"]
+                }
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": f"Fehler: {last_err[:40]}"}
+    return {"ok": False, "msg": f"Alle Treffer fehlgeschlagen ({last_err[:60]})"}
 
 
 def run_scan(scope: str = "all"):
@@ -872,17 +902,18 @@ def run_scan(scope: str = "all"):
 
         raw_items = []
         all_scanned_folders = []
-        jf_dirs = set()
+        jf_slugs = set()
 
-        # 1. Medienserver einlesen (Jellyfin hat Priorität)
         if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
             scan_progress["current_step"] = f"Lese Jellyfin ({scope_name}) ein..."
             jf_items, jf_folders = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""), filter_type=filter_type)
             raw_items.extend(jf_items)
             all_scanned_folders.extend(jf_folders)
             for it in jf_items:
+                jf_slugs.add(f"{slugify(it['title'])}_{it.get('year') or ''}")
+                jf_slugs.add(slugify(it["title"]))
                 if it.get("dir"):
-                    jf_dirs.add(it["dir"])
+                    jf_slugs.add(it["dir"])
 
         if cfg.get("plex_url") and cfg.get("plex_token"):
             scan_progress["current_step"] = f"Lese Plex ({scope_name}) ein..."
@@ -890,33 +921,41 @@ def run_scan(scope: str = "all"):
             raw_items.extend(plex_items)
             all_scanned_folders.extend(plex_folders)
             for it in plex_items:
+                jf_slugs.add(f"{slugify(it['title'])}_{it.get('year') or ''}")
+                jf_slugs.add(slugify(it["title"]))
                 if it.get("dir"):
-                    jf_dirs.add(it["dir"])
+                    jf_slugs.add(it["dir"])
 
-        # 2. Lokale Medienquellen einlesen (mit DEDUPLIZIERUNG gegen Jellyfin)
         if cfg.get("local_scan_enabled", True):
             scan_progress["current_step"] = "Prüfe lokale Medienordner..."
             loc_items, loc_folders = scan_local_folders(
                 cfg.get("local_media_paths", "/media"),
                 filter_type=filter_type,
-                exclude_dirs=jf_dirs
+                exclude_slugs=jf_slugs
             )
             raw_items.extend(loc_items)
             all_scanned_folders.extend(loc_folders)
 
-        by_dir = {}
+        # BEREINIGUNG VON ALTEN DUPLIKATEN AUS STATE
+        current_state_items = {}
         for it in raw_items:
-            by_dir[it["dir"]] = it
+            current_state_items[it["id"]] = it
 
-        if scope == "all":
-            state["folders"] = all_scanned_folders
-            scan_progress["folders_scanned"] = all_scanned_folders
+        # Bereinige alte lokale Duplikate aus vorherigen Versionen
+        cleaned_existing = {}
+        for k, v in state.get("items", {}).items():
+            if v.get("source") == "Lokal":
+                v_slug = f"{slugify(v.get('title',''))}_{v.get('year') or ''}"
+                if v_slug in jf_slugs or slugify(v.get('title','')) in jf_slugs:
+                    continue
+            cleaned_existing[k] = v
+        state["items"] = cleaned_existing
 
-        total_items = len(by_dir)
+        total_items = len(current_state_items)
         scan_progress["total"] = total_items
         jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
-        items_list = list(by_dir.values())
+        items_list = list(current_state_items.values())
 
         for idx, it in enumerate(items_list, 1):
             if stop_requested:
@@ -939,9 +978,11 @@ def run_scan(scope: str = "all"):
 
             if theme_exists:
                 status_txt = existing.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
+                scan_progress["item_status"][item_id] = {"status": "ok", "percent": 100, "step": "Vorhanden"}
             else:
                 prev_status = existing.get("status", "")
                 status_txt = prev_status if prev_status and prev_status != "Vorhanden" else "Fehlt"
+                scan_progress["item_status"][item_id] = {"status": "missing", "percent": 0, "step": "Fehlt"}
 
             record = {
                 **existing,
@@ -950,6 +991,9 @@ def run_scan(scope: str = "all"):
                 "status": status_txt
             }
             state["items"][item_id] = record
+
+        if scope == "all":
+            state["folders"] = all_scanned_folders
 
         save_state(state)
         if not stop_requested:
@@ -1059,6 +1103,13 @@ def get_poster(item_id: str):
     if not item:
         raise HTTPException(status_code=404)
 
+    p = Path(item.get("dir", ""))
+    if p.exists() and p.is_dir():
+        for fname in ("poster.jpg", "folder.jpg", "cover.jpg", "show.jpg", "poster.png", "folder.png"):
+            img_file = p / fname
+            if img_file.exists():
+                return FileResponse(img_file)
+
     if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
         jf_url = cfg["jellyfin_url"]
         raw_id = item["jf_raw_id"]
@@ -1078,13 +1129,6 @@ def get_poster(item_id: str):
                     return Response(content=r.content, media_type=r.headers.get("Content-Type", "image/jpeg"))
             except Exception:
                 pass
-
-    p = Path(item.get("dir", ""))
-    if p.exists() and p.is_dir():
-        for fname in ("poster.jpg", "folder.jpg", "cover.jpg", "show.jpg", "poster.png", "folder.png"):
-            img_file = p / fname
-            if img_file.exists():
-                return FileResponse(img_file)
 
     initial = (item.get("title") or "?")[0].upper()
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="90" viewBox="0 0 60 90">
@@ -1243,7 +1287,74 @@ def delete_theme(
     return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
 
 
-# TEST API ENDPOINTS
+# TMM FEATURE: POSTER MANUELL ZIEHEN
+@app.post("/fetch-poster/{item_id}")
+def api_fetch_poster(
+    item_id: str,
+    tab: str = Form("filme"),
+    filter_status: str = Form("all"),
+    q: str = Form("")
+):
+    state = load_state()
+    item = state["items"].get(item_id)
+    if item:
+        save_poster_to_disk(item)
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
+
+# TMM FEATURE: RENAMER (VORSCHAU & DATEINAMEN BEREINIGEN)
+class RenameReq(BaseModel):
+    item_id: str
+    target_mode: str = "standard"  # standard: "Titel (Jahr)"
+
+@app.post("/api/rename")
+def api_rename_item(data: RenameReq):
+    state = load_state()
+    item = state["items"].get(data.item_id)
+    if not item or not item.get("dir"):
+        return {"ok": False, "msg": "Eintrag oder Pfad nicht gefunden"}
+
+    item_dir = Path(item["dir"])
+    if not item_dir.exists():
+        return {"ok": False, "msg": f"Verzeichnis {item_dir} existiert nicht"}
+
+    title = item.get("title", "").strip()
+    year = item.get("year")
+    clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
+    new_dir_name = f"{clean_title} ({year})" if year else clean_title
+
+    renamed_files = []
+    # 1. Benenne Videodateien um
+    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts"}
+    for f in item_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in video_exts:
+            if item.get("type") == "Film":
+                new_file_name = f"{new_dir_name}{f.suffix.lower()}"
+                new_file_path = item_dir / new_file_name
+                if f != new_file_path and not new_file_path.exists():
+                    try:
+                        f.rename(new_file_path)
+                        renamed_files.append(f"{f.name} ➔ {new_file_name}")
+                    except Exception as e:
+                        return {"ok": False, "msg": f"Fehler beim Umbenennen: {e}"}
+
+    # 2. Benenne den Ordner selbst um (falls abweichend)
+    if item_dir.name != new_dir_name and item_dir.parent.exists():
+        new_dir_path = item_dir.parent / new_dir_name
+        if not new_dir_path.exists():
+            try:
+                item_dir.rename(new_dir_path)
+                item["dir"] = str(new_dir_path)
+                state["items"][data.item_id] = item
+                save_state(state)
+                renamed_files.append(f"Ordner: {item_dir.name} ➔ {new_dir_name}")
+            except Exception as e:
+                return {"ok": False, "msg": f"Ordner-Umbenennung fehlgeschlagen: {e}"}
+
+    return {"ok": True, "msg": "Erfolgreich umbenannt: " + (", ".join(renamed_files) or "Bereits sauber benannt!")}
+
+
 class TestJellyfinReq(BaseModel):
     url: str
     api_key: str
@@ -1268,7 +1379,6 @@ def api_test_folder(data: TestFolderReq):
     return test_folder_path(data.paths)
 
 
-# SEPARATE EINSTELLUNGS-SEITE (/settings)
 @app.get("/settings", response_class=HTMLResponse)
 def get_settings_page():
     cfg = load_config()
@@ -1322,7 +1432,6 @@ def get_settings_page():
 
         <form method="post" action="/settings">
             
-            <!-- 1. FESTPLATTE -->
             <div class="card">
                 <h2>
                     <span>📁 1. Lokale Medienquellen (Festplatte)</span>
@@ -1342,7 +1451,6 @@ def get_settings_page():
                 </div>
             </div>
 
-            <!-- 2. JELLYFIN & PLEX -->
             <div class="card">
                 <h2>
                     <span>🎬 2. Medienserver (Jellyfin / Plex)</span>
@@ -1378,7 +1486,6 @@ def get_settings_page():
                 </div>
             </div>
 
-            <!-- 3. DOWNLOAD-KRITERIEN -->
             <div class="card">
                 <h2>⚡ 3. Download-Kriterien & Audio-Veredelung</h2>
                 <div class="form-grid">
@@ -1390,15 +1497,15 @@ def get_settings_page():
                     <div class="form-group">
                         <label>Max. Titellänge (Sekunden)</label>
                         <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
-                        <small>Verhindert ganze Alben und 1-Stunden-Loops (Standard: 270s)</small>
+                        <small>Verhindert ganze Alben und Loops (Standard: 270s)</small>
                     </div>
                     <div class="checkbox-group">
                         <input type="checkbox" id="audio_fade" name="audio_fade" {'checked' if cfg.get('audio_fade', True) else ''}>
-                        <label for="audio_fade"><strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s weich anblenden, 3s ausblenden</label>
+                        <label for="audio_fade"><strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s sanft anblenden, 3s ausblenden</label>
                     </div>
                     <div class="checkbox-group">
                         <input type="checkbox" id="embed_cover" name="embed_cover" {'checked' if cfg.get('embed_cover', True) else ''}>
-                        <label for="embed_cover"><strong>Cover-Bild direkt in MP3 einbetten (ID3-Tag)</strong></label>
+                        <label for="embed_cover"><strong>Cover-Bild direkt in MP3 einbetten (ID3-Tag) & poster.jpg speichern</strong></label>
                     </div>
                 </div>
             </div>
@@ -1518,7 +1625,6 @@ def update_settings(
     return RedirectResponse("/?settings=saved", status_code=303)
 
 
-# HAUPTANSICHT
 @app.get("/", response_class=HTMLResponse)
 def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings: str = ""):
     cfg = load_config()
@@ -1593,6 +1699,18 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             else:
                 sub_info = ""
 
+        # TMM Status: Prüfe ob lokales Poster existiert
+        p_dir = Path(it.get("dir", ""))
+        has_local_poster = (p_dir / "poster.jpg").exists() or (p_dir / "folder.jpg").exists()
+        poster_btn = (
+            '<form method="post" action="/fetch-poster/' + iid + '" style="display:inline;" title="Lädt Poster in den Medienordner (TMM)">'
+            f'<input type="hidden" name="tab" value="{clean_tab}">'
+            f'<input type="hidden" name="filter_status" value="{filter_status}">'
+            f'<input type="hidden" name="q" value="{q}">'
+            '<button type="submit" class="btn-sm secondary">🖼️ Poster</button>'
+            '</form>'
+        ) if not has_local_poster else '<span title="poster.jpg vorhanden" style="font-size:0.75rem; color:#7d8590;">✓ Poster</span>'
+
         rows += f"""
         <tr id="row_{iid}">
             <td style="width: 50px; padding: 6px;">
@@ -1611,7 +1729,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <td>{player}</td>
             <td style="white-space: nowrap;">
                 <div style="display:inline-flex; gap:4px; align-items:center;">
-                    <form method="post" action="/replace/{iid}" class="inline-form" onsubmit="this.querySelector('button').innerText='⏳ Lädt...';">
+                    <form method="post" action="/replace/{iid}" class="inline-form" onsubmit="this.querySelector('button').innerText='⏳';">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
                         <input type="hidden" name="q" value="{q}">
@@ -1624,6 +1742,8 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         <input type="hidden" name="q" value="{q}">
                         <button type="submit" class="btn-sm secondary" title="Nur diesen Eintrag neu prüfen">🔄</button>
                     </form>
+                    {poster_btn}
+                    <button type="button" class="btn-sm secondary" title="TMM-Renamer: Datei/Ordner nach Standard umbenennen" onclick="triggerRename('{iid}', '{it['title']}')">🏷️</button>
                     <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('Theme löschen und sperren?');">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
@@ -1631,6 +1751,16 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         <button type="submit" class="btn-sm danger" title="Löschen & Blockieren">✕</button>
                     </form>
                 </div>
+            </td>
+            <!-- NEUE FORTSCHRITTS-SPALTE HINTER AKTIONEN -->
+            <td style="min-width: 140px; font-size: 0.8rem;" id="prog_col_{iid}">
+                <div id="prog_bar_box_{iid}" style="display:none;">
+                    <div style="background:#262a32; height:8px; border-radius:4px; overflow:hidden; margin-bottom:4px;">
+                        <div id="prog_bar_fill_{iid}" style="background:#28a745; height:100%; width:0%; transition:width 0.3s;"></div>
+                    </div>
+                    <span id="prog_bar_txt_{iid}" style="color:#7db2ff; font-size:0.75rem;">Verarbeite...</span>
+                </div>
+                <span id="prog_static_{iid}" style="color:#7d8590;">{'✓ Bereit' if has_theme else 'Fehlt'}</span>
             </td>
         </tr>
         """
@@ -1646,7 +1776,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Theme Fetcher</title>
+        <title>Theme Fetcher & Media Enricher</title>
         <style>
             :root {{
                 --bg: #121417;
@@ -1716,13 +1846,12 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher</h1>
+                <h1>🎵 Theme Fetcher & Media Enricher</h1>
                 <div class="stats">Filme: {filme_ok}/{total_filme} • Serien: {serien_ok}/{total_serien} • Collections: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <a href="/settings" class="btn secondary">⚙️ Einstellungen</a>
 
-                <!-- GEZIELTER SCAN -->
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
                     <input type="hidden" name="tab" value="{clean_tab}">
@@ -1731,7 +1860,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <button type="submit" title="Scannt nur die aktuelle Kategorie ({scope_label})">🔍 Nur {scope_label} scannen</button>
                 </form>
 
-                <!-- ALLES SCANNEN -->
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="all">
                     <input type="hidden" name="tab" value="{clean_tab}">
@@ -1740,7 +1868,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <button type="submit" class="secondary" title="Kompletten Scan über alle Kategorien ausführen">🌐 Alles scannen</button>
                 </form>
 
-                <!-- GEZIELTER DOWNLOAD -->
                 <form method="post" action="/download" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
                     <input type="hidden" name="tab" value="{clean_tab}">
@@ -1769,7 +1896,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 <span>Erfolgreich geladen: <strong id="progDown" style="color:#5ce69a;">0</strong> | Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
             </div>
 
-            <!-- AUSKLAPPBARE WARTESCHLANGE & VERLAUF -->
             <div id="queueBox" class="queue-box" style="display:none;">
                 <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">📋 Nächste in der Download-Warteschlange:</div>
                 <div id="queueList" style="color:var(--text-muted); font-size:0.8rem; margin-bottom:10px;">-</div>
@@ -1823,9 +1949,10 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         <th>Status</th>
                         <th>Vorschau</th>
                         <th>Aktionen</th>
+                        <th>Fortschritt</th>
                     </tr>
                 </thead>
-                <tbody>{rows or f'<tr><td colspan="5" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge unter {scope_label} gefunden.</td></tr>'}</tbody>
+                <tbody>{rows or f'<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge unter {scope_label} gefunden.</td></tr>'}</tbody>
             </table>
         </div>
 
@@ -1839,6 +1966,24 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     }}
                 }}
             }}, true);
+
+            async function triggerRename(itemId, title) {{
+                if (!confirm('TMM-Renamer: Möchtest du die Mediendateien und den Ordner für "' + title + '" nach Jellyfin/Plex-Standard umbenennen?')) {{
+                    return;
+                }}
+                try {{
+                    const resp = await fetch('/api/rename', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{ item_id: itemId }})
+                    }});
+                    const data = await resp.json();
+                    alert(data.msg);
+                    if (data.ok) location.reload();
+                }} catch (e) {{
+                    alert('Fehler beim Umbenennen: ' + e);
+                }}
+            }}
 
             async function cancelRunningAction() {{
                 try {{
@@ -1865,10 +2010,20 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         document.getElementById('progDown').innerText = data.new_downloaded;
                         document.getElementById('progFail').innerText = data.failed;
 
+                        // TABELLEN-FORTSCHRITTSBALKEN PRO ZEILE AKTUALISIEREN
                         if (data.current_item_id) {{
-                            const rowStatus = document.getElementById('status_box_' + data.current_item_id);
-                            if (rowStatus) {{
-                                rowStatus.innerHTML = '<span class="badge active-dl">⏳ Lade Theme...</span>';
+                            const barBox = document.getElementById('prog_bar_box_' + data.current_item_id);
+                            const barFill = document.getElementById('prog_bar_fill_' + data.current_item_id);
+                            const barTxt = document.getElementById('prog_bar_txt_' + data.current_item_id);
+                            const barStatic = document.getElementById('prog_static_' + data.current_item_id);
+                            
+                            if (barBox && barFill && barTxt) {{
+                                barBox.style.display = 'block';
+                                if (barStatic) barStatic.style.display = 'none';
+                                const itemInfo = (data.item_status && data.item_status[data.current_item_id]) || {{}};
+                                const pct = itemInfo.percent || 50;
+                                barFill.style.width = pct + '%';
+                                barTxt.innerText = itemInfo.step || 'Lädt Theme...';
                             }}
                         }}
 
