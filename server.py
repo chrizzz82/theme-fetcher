@@ -172,6 +172,15 @@ def scan_local_folders(paths_str: str) -> List[dict]:
     return results
 
 
+def get_jellyfin_headers(api_key: str) -> dict:
+    clean_key = api_key.strip()
+    return {
+        "X-Emby-Token": clean_key,
+        "X-MediaBrowser-Token": clean_key,
+        "Authorization": f"MediaBrowser Token=\"{clean_key}\", Client=\"ThemeFetcher\", Device=\"ZimaOS\", DeviceId=\"theme-fetcher-zimaos\", Version=\"1.0.0\"",
+        "Accept": "application/json"
+    }
+
 def test_jellyfin_connection(url: str, api_key: str) -> dict:
     url = url.strip().rstrip("/")
     api_key = api_key.strip()
@@ -180,7 +189,7 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
     if not api_key:
         return {"ok": False, "msg": "Bitte einen API-Key eintragen"}
 
-    headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+    headers = get_jellyfin_headers(api_key)
     try:
         # Test 1: System Info
         sys_resp = requests.get(f"{url}/System/Info", headers=headers, timeout=6)
@@ -192,7 +201,7 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
             version = s_data.get("Version", "")
 
         # Test 2: Users check API key validity
-        users_resp = requests.get(f"{url}/Users", headers=headers, timeout=6)
+        users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key}, timeout=6)
         if users_resp.status_code == 401 or users_resp.status_code == 403:
             return {"ok": False, "msg": f"URL erreichbar, aber API-Key ungültig (HTTP {users_resp.status_code})"}
         users_resp.raise_for_status()
@@ -274,10 +283,10 @@ def test_folder_path(paths_str: str) -> dict:
 def fetch_jellyfin_items(url: str, api_key: str) -> List[dict]:
     if not url or not api_key:
         return []
-    headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+    headers = get_jellyfin_headers(api_key)
     results = []
     try:
-        users_resp = requests.get(f"{url}/Users", headers=headers, timeout=10)
+        users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key.strip()}, timeout=10)
         users_resp.raise_for_status()
         users = users_resp.json()
         if not users:
