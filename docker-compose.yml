@@ -9,6 +9,7 @@ services:
     volumes:
       # Zentraler Medienordner (auf ZimaOS z.B. /DATA/Media):
       - /DATA/Media:/media
+      - /media:/media
       # Persistenter Speicher für Status, Blacklist & Sammlungen:
       - /DATA/AppData/theme-fetcher/data:/data
       # Optional für Jellyfin BoxSet Metadata Sync:
