@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Dict
 from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
+from PIL import Image
 
 app = FastAPI(title="Theme Fetcher")
 
@@ -37,7 +38,8 @@ DEFAULT_CONFIG = {
     "scan_interval_hours": int(os.getenv("SCAN_INTERVAL_HOURS", "12")),
     "audio_fade": True,
     "embed_cover": True,
-    "auto_download": False
+    "auto_download": False,
+    "ui_language": "en"
 }
 
 EXCLUDE_KEYWORDS = [
@@ -53,13 +55,251 @@ EXCLUDE_KEYWORDS = [
 
 THEME_REGEX = re.compile(r".*themes?.*\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
 
+# Multi-Language Dictionary
+LANG_PACK = {
+    "de": {
+        "app_title": "Theme Fetcher",
+        "movies": "Filme",
+        "shows": "Serien",
+        "collections": "Collections",
+        "libraries": "Eingelesene Mediatheken",
+        "movies_plural": "Filme",
+        "shows_plural": "Serien",
+        "collections_plural": "Collections",
+        "all_media": "alle Medien",
+        "settings": "Einstellungen",
+        "settings_title": "Einstellungen & Quellen",
+        "back_to_lib": "← Zurück zur Mediathek",
+        "scan_only": "🔍 Nur {scope} scannen",
+        "scan_all": "🌐 Alles scannen",
+        "download_missing": "⬇️ {scope} laden ({count})",
+        "cancel": "🛑 Abbrechen",
+        "cancelling": "Abbruch angefordert...",
+        "cancel_requested": "Abbruch angefordert",
+        "ready": "Bereit",
+        "scanning": "Lese {scope} ein...",
+        "fetching_jf": "Lese Jellyfin ({scope}) ein...",
+        "fetching_plex": "Lese Plex ({scope}) ein...",
+        "scanning_local": "Prüfe lokale Ordner ({scope})...",
+        "scan_cancelled": "Scan abgebrochen!",
+        "scan_complete": "Scan abgeschlossen: {count} {scope} erfasst.",
+        "scan_error": "Fehler beim Scan: {err}",
+        "init_queue": "Initialisiere Download-Warteschlange...",
+        "no_missing": "Keine fehlenden Themes in dieser Kategorie!",
+        "download_cancelled": "Download abgebrochen!",
+        "downloading_item": "Lade ({idx}/{total}): {title}...",
+        "download_complete": "Download fertig! {down} geladen, {fail} fehlgeschlagen.",
+        "download_error": "Fehler beim Download: {err}",
+        "searching_soundtrack": "Suche Soundtrack...",
+        "no_soundtrack_found": "Kein Soundtrack gefunden",
+        "no_clean_theme": "Keine reine Titelmusik gefunden (nur Trailer/Szenen oder keine Treffer)",
+        "downloading_candidate": "Lade ({idx}/{total}): {title}...",
+        "mastering_audio": "Schneide Audio (Fade-In/Out)...",
+        "download_success": "Erfolgreich geladen!",
+        "error_prefix": "Fehler: ",
+        "all_failed": "Alle Treffer fehlgeschlagen ({err})",
+        "op_in_progress": "Aktion läuft...",
+        "processing": "Verarbeite...",
+        "downloaded_stat": "Erfolgreich geladen",
+        "failed_stat": "Fehler",
+        "next_in_queue": "📋 Nächste in der Download-Warteschlange:",
+        "recently_finished": "✓ Zuletzt abgeschlossen:",
+        "no_more_queue": "Keine weiteren Titel in der Warteschlange.",
+        "filter_label": "Filter:",
+        "all_pill": "Alle ({count})",
+        "missing_pill": "❌ Fehlt ({count})",
+        "present_pill": "✓ Vorhanden ({count})",
+        "search_placeholder": "{scope} durchsuchen...",
+        "search_btn": "Suchen",
+        "th_cover": "Cover",
+        "th_title_path": "Titel & Pfad",
+        "th_status": "Status",
+        "th_preview": "Vorschau",
+        "th_actions": "Aktionen",
+        "th_progress": "Fortschritt",
+        "status_present": "✓ Vorhanden",
+        "status_missing": "✕ Fehlt",
+        "status_ready": "✓ Bereit",
+        "no_entries": "Keine Einträge unter {scope} gefunden.",
+        "btn_select": "🎵 Auswählen",
+        "btn_select_title": "Theme auswählen (Top Vorschläge vorhören)",
+        "btn_dl_placeholder": "YouTube URL...",
+        "btn_dl_title": "Direkt laden",
+        "btn_recheck_title": "Nur diesen Eintrag neu prüfen",
+        "btn_delete_confirm": "Theme löschen und sperren?",
+        "btn_delete_title": "Löschen & Blockieren",
+        "modal_title": "🎵 Theme-Vorschläge: {title}",
+        "modal_search_placeholder": "Titel / Komponist / YouTube URL...",
+        "modal_search_btn": "🔍 Neue Suche",
+        "modal_searching": "Suche Soundtrack-Kandidaten (MusicBrainz, ThemerrDB, YouTube)...",
+        "modal_identified": "🎯 <strong>Erkannter Soundtrack:</strong> {display} <span style=\"color:#8b929a;\">(Quelle: {source})</span>",
+        "modal_no_matches": "Keine passenden Soundtracks gefunden. Probiere einen anderen Suchbegriff oben!",
+        "modal_open_yt": "Auf YouTube öffnen ↗",
+        "modal_length": "Länge: ",
+        "modal_apply": "✓ Übernehmen",
+        "settings_saved_banner": "✓ Einstellungen erfolgreich gespeichert!",
+        "sec_local": "📁 1. Lokale Medienquellen (Festplatte)",
+        "btn_test_path": "📂 Pfad testen",
+        "lbl_paths": "Medienpfad(e) im Container",
+        "sub_paths": "Standard: <code>/media</code>. Entspricht deinem Docker Volume Mount.",
+        "lbl_local_scan": "Lokalen Festplatten-Scan aktivieren (wird automatisch dedupliziert)",
+        "sec_servers": "🎬 2. Medienserver (Jellyfin / Plex)",
+        "btn_test_jf": "🔌 Jellyfin testen",
+        "btn_test_plex": "🍿 Plex testen",
+        "lbl_jf_url": "Jellyfin Server-IP & Port",
+        "sub_jf_url": "Standard-Port: <strong>8096</strong> (z. B. <code>192.168.1.50:8096</code>)",
+        "lbl_jf_key": "Jellyfin API-Key",
+        "sub_jf_key": "Erstellt unter Jellyfin: Dashboard ➔ API-Schlüssel",
+        "lbl_plex_url": "Plex Server-IP & Port (Optional)",
+        "sub_plex_url": "Standard-Port: <strong>32400</strong> (z. B. <code>192.168.1.50:32400</code>)",
+        "lbl_plex_token": "Plex Token (Optional)",
+        "sub_plex_token": "Dein persönlicher X-Plex-Token",
+        "sec_audio": "⚡ 3. Download-Kriterien & Audio-Veredelung",
+        "lbl_min_dur": "Min. Titellänge (Sekunden)",
+        "sub_min_dur": "Verhindert Jingles und kurze Soundeffekte (Standard: 25s)",
+        "lbl_max_dur": "Max. Titellänge (Sekunden)",
+        "sub_max_dur": "Verhindert ganze Alben und Loops (Standard: 270s)",
+        "lbl_fade": "<strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s sanft anblenden, 3s ausblenden",
+        "sec_lang": "🌐 4. Sprache / Language",
+        "lbl_lang": "Benutzeroberfläche / Interface Language",
+        "btn_save_settings": "💾 Einstellungen speichern & anwenden",
+        "btn_cancel_settings": "Abbrechen",
+        "lib_title": "Gefundene Mediatheken & Verzeichnisse:",
+        "lib_desc": "Hier siehst du alle Mediatheken und Pfade, die Jellyfin und deine Festplatte gemeldet haben:",
+        "lib_empty": "Bisher keine Bibliotheken erfasst. Klicke auf 'Alles scannen'!"
+    },
+    "en": {
+        "app_title": "Theme Fetcher",
+        "movies": "Movies",
+        "shows": "TV Shows",
+        "collections": "Collections",
+        "libraries": "Libraries",
+        "movies_plural": "Movies",
+        "shows_plural": "TV Shows",
+        "collections_plural": "Collections",
+        "all_media": "all media",
+        "settings": "Settings",
+        "settings_title": "Settings & Sources",
+        "back_to_lib": "← Back to Library",
+        "scan_only": "🔍 Scan {scope} Only",
+        "scan_all": "🌐 Scan All",
+        "download_missing": "⬇️ Download {scope} ({count})",
+        "cancel": "🛑 Cancel",
+        "cancelling": "Cancelling...",
+        "cancel_requested": "Cancellation requested",
+        "ready": "Ready",
+        "scanning": "Scanning {scope}...",
+        "fetching_jf": "Fetching Jellyfin ({scope})...",
+        "fetching_plex": "Fetching Plex ({scope})...",
+        "scanning_local": "Scanning local folders ({scope})...",
+        "scan_cancelled": "Scan cancelled!",
+        "scan_complete": "Scan complete: {count} {scope} indexed.",
+        "scan_error": "Scan error: {err}",
+        "init_queue": "Initializing download queue...",
+        "no_missing": "No missing themes in this category!",
+        "download_cancelled": "Download cancelled!",
+        "downloading_item": "Downloading ({idx}/{total}): {title}...",
+        "download_complete": "Download complete! {down} downloaded, {fail} failed.",
+        "download_error": "Download error: {err}",
+        "searching_soundtrack": "Searching soundtrack...",
+        "no_soundtrack_found": "No soundtrack found",
+        "no_clean_theme": "No clean theme music found (only trailers/scenes or no matches)",
+        "downloading_candidate": "Downloading ({idx}/{total}): {title}...",
+        "mastering_audio": "Mastering audio (Fade-in/out)...",
+        "download_success": "Successfully downloaded!",
+        "error_prefix": "Error: ",
+        "all_failed": "All candidates failed ({err})",
+        "op_in_progress": "Operation in progress...",
+        "processing": "Processing...",
+        "downloaded_stat": "Downloaded",
+        "failed_stat": "Failed",
+        "next_in_queue": "📋 Next in Download Queue:",
+        "recently_finished": "✓ Recently Finished:",
+        "no_more_queue": "No more items in queue.",
+        "filter_label": "Filter:",
+        "all_pill": "All ({count})",
+        "missing_pill": "❌ Missing ({count})",
+        "present_pill": "✓ Present ({count})",
+        "search_placeholder": "Search {scope}...",
+        "search_btn": "Search",
+        "th_cover": "Cover",
+        "th_title_path": "Title & Path",
+        "th_status": "Status",
+        "th_preview": "Preview",
+        "th_actions": "Actions",
+        "th_progress": "Progress",
+        "status_present": "✓ Present",
+        "status_missing": "✕ Missing",
+        "status_ready": "✓ Ready",
+        "no_entries": "No entries found in {scope}.",
+        "btn_select": "🎵 Select",
+        "btn_select_title": "Select theme (preview top recommendations)",
+        "btn_dl_placeholder": "YouTube URL / query...",
+        "btn_dl_title": "Download directly",
+        "btn_recheck_title": "Re-check this item",
+        "btn_delete_confirm": "Delete theme and block URL?",
+        "btn_delete_title": "Delete & block",
+        "modal_title": "🎵 Theme Recommendations: {title}",
+        "modal_search_placeholder": "Title / Composer / YouTube URL...",
+        "modal_search_btn": "🔍 Search",
+        "modal_searching": "Searching soundtrack candidates (MusicBrainz, Wikidata, YouTube)...",
+        "modal_identified": "🎯 <strong>Identified Soundtrack:</strong> {display} <span style=\"color:#8b929a;\">(Source: {source})</span>",
+        "modal_no_matches": "No matching soundtracks found. Try a different search query above!",
+        "modal_open_yt": "Open on YouTube ↗",
+        "modal_length": "Length: ",
+        "modal_apply": "✓ Apply",
+        "settings_saved_banner": "✓ Settings saved successfully!",
+        "sec_local": "📁 1. Local Media Storage (Hard Drives & Mounts)",
+        "btn_test_path": "📂 Test Path",
+        "lbl_paths": "Container Media Path(s)",
+        "sub_paths": "Default: <code>/media</code>. Matches your Docker volume mount.",
+        "lbl_local_scan": "Enable local storage scan (automatically deduplicated with Jellyfin/Plex)",
+        "sec_servers": "🎬 2. Media Servers (Jellyfin / Plex)",
+        "btn_test_jf": "🔌 Test Jellyfin",
+        "btn_test_plex": "🍿 Test Plex",
+        "lbl_jf_url": "Jellyfin Server IP & Port",
+        "sub_jf_url": "Default Port: <strong>8096</strong> (e.g. <code>192.168.1.50:8096</code>)",
+        "lbl_jf_key": "Jellyfin API Key",
+        "sub_jf_key": "Generated in Jellyfin: Dashboard ➔ API Keys",
+        "lbl_plex_url": "Plex Server IP & Port (Optional)",
+        "sub_plex_url": "Default Port: <strong>32400</strong> (e.g. <code>192.168.1.50:32400</code>)",
+        "lbl_plex_token": "Plex Token (Optional)",
+        "sub_plex_token": "Your personal X-Plex-Token",
+        "sec_audio": "⚡ 3. Download Criteria & Audio Mastering",
+        "lbl_min_dur": "Min. Track Duration (seconds)",
+        "sub_min_dur": "Prevents stingers, logos and sound effects (Default: 25s)",
+        "lbl_max_dur": "Max. Track Duration (seconds)",
+        "sub_max_dur": "Prevents full OST albums and long loops (Default: 270s)",
+        "lbl_fade": "<strong>Smooth Audio Fade-In & Fade-Out:</strong> 1.5s gentle fade-in, 3.0s fade-out",
+        "sec_lang": "🌐 4. Interface Language",
+        "lbl_lang": "Select UI Language",
+        "btn_save_settings": "💾 Save & Apply Settings",
+        "btn_cancel_settings": "Cancel",
+        "lib_title": "Discovered Libraries & Media Directories:",
+        "lib_desc": "Overview of all storage paths and media server libraries indexed by Theme Fetcher:",
+        "lib_empty": "No libraries indexed yet. Click 'Scan All' to scan your media!"
+    }
+}
+
+def get_t(cfg: dict, key: str, **kwargs) -> str:
+    lang = cfg.get("ui_language", "de")
+    pack = LANG_PACK.get(lang, LANG_PACK["de"])
+    val = pack.get(key, LANG_PACK["en"].get(key, key))
+    if kwargs:
+        try:
+            return val.format(**kwargs)
+        except Exception:
+            return val
+    return val
+
+
 state_lock = threading.Lock()
 stop_requested = False
 
 scan_progress = {
     "is_running": False,
     "action_type": "",
-    "current_step": "Bereit",
+    "current_step": "Ready",
     "current_item_id": "",
     "current_item_title": "",
     "item_status": {},  # item_id -> {"status": str, "percent": int, "step": str}
@@ -104,7 +344,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"items": {}, "blacklist": {}, "folders": []}
+    return {"items": {}, "blacklist": {}, "folders": [], "soundtrack_cache": {}}
 
 
 def save_state(state: dict):
@@ -119,13 +359,13 @@ def slugify(text: str) -> str:
 
 def normalize_tab(tab_name: str) -> str:
     t = (tab_name or "").lower().strip()
-    if "seri" in t or "show" in t:
-        return "serien"
+    if "seri" in t or "show" in t or "tv" in t:
+        return "shows"
     if "col" in t or "box" in t:
         return "collections"
-    if "ordn" in t or "fold" in t:
-        return "ordner"
-    return "filme"
+    if "ordn" in t or "fold" in t or "lib" in t:
+        return "libraries"
+    return "movies"
 
 
 def find_theme_file_in_dir(d: Path) -> Optional[Path]:
@@ -146,8 +386,63 @@ def find_theme_file_in_dir(d: Path) -> Optional[Path]:
     return None
 
 
+def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
+    """Erkennt Film-/Serienplakate tolerant nach Namen & prüft Hochformat (Aspect Ratio)"""
+    if not d.exists() or not d.is_dir():
+        return None
+
+    img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    candidates = []
+
+    try:
+        for f in d.iterdir():
+            if f.is_file() and f.suffix.lower() in img_exts:
+                candidates.append(f)
+    except Exception:
+        return None
+
+    if not candidates:
+        return None
+
+    title_slug = slugify(title) if title else ""
+
+    # 1. Bevorzuge typische Plakat-Namen
+    for f in candidates:
+        fname = f.stem.lower()
+        if fname in ("poster", "folder", "cover", "front", "default", "show"):
+            return f
+        if "poster" in fname or "cover" in fname or "front" in fname:
+            return f
+        if title_slug and title_slug in slugify(fname):
+            return f
+
+    # 2. Metadaten-Check mit Pillow: Plakate sind Hochformat (Höhe > Breite)
+    portraits = []
+    for f in candidates:
+        try:
+            with Image.open(f) as img:
+                w, h = img.size
+                if h > w and (h / max(1, w)) >= 1.15:
+                    portraits.append((h / w, f))
+        except Exception:
+            pass
+
+    if portraits:
+        # Sortiere nach bestem Filmplakat-Verhältnis (~1.4 bis 1.5)
+        portraits.sort(key=lambda x: abs(x[0] - 1.48))
+        return portraits[0][1]
+
+    # 3. Fallback: Erstes Bild, das kein backdrop / fanart im Namen hat
+    for f in candidates:
+        fname = f.stem.lower()
+        if not any(x in fname for x in ("backdrop", "fanart", "thumb", "banner", "logo", "clearart")):
+            return f
+
+    return candidates[0]
+
+
 def resolve_media_path(raw_path_str: str) -> Path:
-    """Intelligentes Multi-Platten-Mapping: Löst Pfade über alle ZimaOS-Platten auf (/media/Serien, /media/HDD-Storage)"""
+    """Multi-disk path mapping: Resolves media paths across container mounts"""
     raw_str = raw_path_str.replace("\\", "/")
     p = Path(raw_str)
     if p.exists():
@@ -158,12 +453,10 @@ def resolve_media_path(raw_path_str: str) -> Path:
         return Path("/media")
 
     media_base = Path("/media")
-    # 1. Direktes Voranstellen von /media (z. B. /Serien/Die Dinos -> /media/Serien/Die Dinos)
     cand_media = media_base.joinpath(*parts)
     if cand_media.exists() or cand_media.parent.exists():
         return cand_media
 
-    # 2. Prüfe alle Festplatten-Mounts unter /media
     if media_base.exists():
         try:
             for disk in media_base.iterdir():
@@ -178,7 +471,6 @@ def resolve_media_path(raw_path_str: str) -> Path:
         except Exception:
             pass
 
-    # 3. Tiefensuche nach Ordnername
     target_name = parts[-1].lower()
     target_slug = slugify(parts[-1])
     if media_base.exists():
@@ -200,7 +492,7 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.4.0"',
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="1.9.0"',
         "Accept": "application/json"
     }
 
@@ -228,6 +520,81 @@ def check_jellyfin_has_theme(jf_url: str, api_key: str, jf_raw_id: str) -> Tuple
         pass
     return False, ""
 
+
+
+"""Soundtrack-Spuerhund Integration"""
+import re
+import requests
+
+def discover_soundtrack(title: str, orig: str = "", tmdb_id: str = "") -> dict:
+    info = {"title": "", "composer": "", "source": "", "display": "", "direct_url": ""}
+    # MusicBrainz
+    clean = re.sub(r"[^\w\s]", "", orig or title).strip()
+    headers = {"User-Agent": "ThemeFetcher/1.6.0"}
+    try:
+        url = "https://musicbrainz.org/ws/2/release-group"
+        p = {"query": f'releasegroup:"{clean}" AND type:soundtrack', "fmt": "json", "limit": "3"}
+        r = requests.get(url, headers=headers, params=p, timeout=4)
+        if r.status_code == 200:
+            rgs = r.json().get("release-groups", [])
+            if rgs:
+                rg = rgs[0]
+                artists = rg.get("artist-credit", [])
+                c_name = artists[0].get("name", "") if artists else ""
+                info["composer"] = c_name
+                info["title"] = "Soundtrack"
+                info["source"] = "MusicBrainz"
+                info["display"] = f"{c_name} - Soundtrack" if c_name else "Soundtrack"
+                return info
+    except Exception:
+        pass
+
+    # Wikidata
+    try:
+        w_url = "https://www.wikidata.org/w/api.php"
+        wp = {"action": "wbsearchentities", "search": clean, "language": "de", "format": "json", "limit": "3"}
+        wr = requests.get(w_url, params=wp, timeout=3)
+        if wr.status_code == 200:
+            for ent in wr.json().get("search", []):
+                e_id = ent.get("id")
+                if e_id:
+                    cp = {"action": "wbgetclaims", "entity": e_id, "property": "P86", "format": "json"}
+                    cr = requests.get(w_url, params=cp, timeout=3)
+                    if cr.status_code == 200:
+                        cl = cr.json().get("claims", {}).get("P86", [])
+                        if cl:
+                            comp_id = cl[0].get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
+                            if comp_id:
+                                lp = {"action": "wbgetentities", "ids": comp_id, "props": "labels", "languages": "de", "format": "json"}
+                                lr = requests.get(w_url, params=lp, timeout=3)
+                                if lr.status_code == 200:
+                                    lbl = lr.json().get("entities", {}).get(comp_id, {}).get("labels", {}).get("de", {}).get("value")
+                                    if lbl:
+                                        info["composer"] = lbl
+                                        info["title"] = "Titelmusik"
+                                        info["source"] = "Wikidata"
+                                        info["display"] = f"{lbl} - Titelmusik"
+                                        return info
+    except Exception:
+        pass
+
+    return info
+
+
+def discover_soundtrack_info(item: dict) -> dict:
+    state = load_state()
+    cache = state.setdefault("soundtrack_cache", {})
+    item_id = item.get("id", "")
+    if item_id in cache:
+        return cache[item_id]
+    info = discover_soundtrack(
+        item.get("title", ""),
+        item.get("original_title", ""),
+        item.get("tmdb_id", "")
+    )
+    cache[item_id] = info
+    save_state(state)
+    return info
 
 def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
     """Tiefensuche: Prüft Festplatten & Jellyfin-API auf vorhandene theme.mp3"""
@@ -271,7 +638,7 @@ def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[di
             it["dir"] = d_str
             return True, d_str, theme_file
 
-    # Rekursive Suche im gesamten /media Mount nach Ordnername (z. B. Die Dinos)
+    # Recursive search in /media mount for matching folder name
     title_raw = it.get("title", "").strip().lower()
     title_slug = slugify(title_raw)
     media_base = Path("/media")
@@ -344,10 +711,10 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
     for base_str in paths:
         base = Path(base_str)
         if not base.exists() or not base.is_dir():
-            scanned_dirs.append(f"❌ {base_str} (Pfad existiert nicht im Container)")
+            scanned_dirs.append(f"❌ {base_str} (Path does not exist in container)")
             continue
 
-        scanned_dirs.append(f"📁 Lokaler Mount: {base_str}")
+        scanned_dirs.append(f"📁 Local Storage Mount: {base_str}")
         try:
             for root, dirs, files in os.walk(base):
                 global stop_requested
@@ -412,9 +779,9 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
     url = clean_url_input(url)
     api_key = api_key.strip()
     if not url:
-        return {"ok": False, "msg": "Bitte Jellyfin IP und Port eingeben (z. B. 192.168.178.50:8096)"}
+        return {"ok": False, "msg": "Please enter Jellyfin IP and port (e.g. 192.168.1.50:8096)"}
     if not api_key:
-        return {"ok": False, "msg": "Bitte API-Key eintragen"}
+        return {"ok": False, "msg": "Please enter Jellyfin API Key"}
 
     headers = get_jellyfin_headers(api_key)
     try:
@@ -428,7 +795,7 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
 
         users_resp = requests.get(f"{url}/Users", headers=headers, params={"api_key": api_key}, timeout=6)
         if users_resp.status_code in (401, 403):
-            return {"ok": False, "msg": f"URL erreichbar, aber API-Key ungültig (HTTP {users_resp.status_code})"}
+            return {"ok": False, "msg": f"URL reachable, but API key is invalid (HTTP {users_resp.status_code})"}
         users_resp.raise_for_status()
         users = users_resp.json()
 
@@ -440,12 +807,12 @@ def test_jellyfin_connection(url: str, api_key: str) -> dict:
         )
         item_count = it_resp.json().get("TotalRecordCount", 0) if it_resp.status_code == 200 else 0
 
-        info_txt = f"Verbunden mit '{server_name}' (v{version}) • {len(users)} Benutzer • {item_count} Medien gefunden!"
+        info_txt = f"Connected to '{server_name}' (v{version}) • {len(users)} users • {item_count} media items found!"
         return {"ok": True, "msg": info_txt}
     except requests.exceptions.ConnectTimeout:
-        return {"ok": False, "msg": "Zeitüberschreitung (Timeout). Läuft Jellyfin unter dieser IP und diesem Port?"}
+        return {"ok": False, "msg": "Connection timeout. Is Jellyfin running on this IP and port?"}
     except requests.exceptions.ConnectionError:
-        return {"ok": False, "msg": "Verbindung abgelehnt. Bitte IP und Port prüfen (z. B. 192.168.178.50:8096)!"}
+        return {"ok": False, "msg": "Connection refused. Please verify IP and port (e.g. 192.168.1.50:8096)!"}
     except Exception as e:
         return {"ok": False, "msg": f"Fehler: {str(e)}"}
 
@@ -454,20 +821,20 @@ def test_plex_connection(url: str, token: str) -> dict:
     url = clean_url_input(url)
     token = token.strip()
     if not url:
-        return {"ok": False, "msg": "Bitte Plex IP und Port eintragen (z. B. 192.168.178.50:32400)"}
+        return {"ok": False, "msg": "Please enter Plex IP and port (e.g. 192.168.1.50:32400)"}
     if not token:
-        return {"ok": False, "msg": "Bitte Plex Token eintragen"}
+        return {"ok": False, "msg": "Please enter Plex Token"}
 
     headers = {"X-Plex-Token": token, "Accept": "application/json"}
     try:
         resp = requests.get(f"{url}/", headers=headers, timeout=6)
         if resp.status_code in (401, 403):
-            return {"ok": False, "msg": "URL erreichbar, aber Plex Token ist ungültig!"}
+            return {"ok": False, "msg": "URL reachable, but Plex token is invalid!"}
         resp.raise_for_status()
         data = resp.json().get("MediaContainer", {})
         friendly_name = data.get("friendlyName", "Plex Server")
         version = data.get("version", "")
-        return {"ok": True, "msg": f"Verbunden mit '{friendly_name}' (v{version})!"}
+        return {"ok": True, "msg": f"Connected to '{friendly_name}' (v{version})!"}
     except Exception as e:
         return {"ok": False, "msg": f"Plex Fehler: {str(e)}"}
 
@@ -475,7 +842,7 @@ def test_plex_connection(url: str, token: str) -> dict:
 def test_folder_path(paths_str: str) -> dict:
     paths_str = paths_str.strip()
     if not paths_str:
-        return {"ok": False, "msg": "Kein Pfad angegeben"}
+        return {"ok": False, "msg": "No path specified"}
 
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     details = []
@@ -483,14 +850,14 @@ def test_folder_path(paths_str: str) -> dict:
     for p in paths:
         path_obj = Path(p)
         if not path_obj.exists():
-            details.append(f"❌ '{p}' existiert nicht im Container")
+            details.append(f"❌ '{p}' does not exist in container")
         elif not path_obj.is_dir():
-            details.append(f"❌ '{p}' ist kein Verzeichnis")
+            details.append(f"❌ '{p}' is not a directory")
         else:
             try:
                 subdirs = [d.name for d in path_obj.iterdir() if d.is_dir() and not d.name.startswith(".")]
                 files = [f.name for f in path_obj.iterdir() if f.is_file()]
-                details.append(f"✓ '{p}': {len(subdirs)} Unterordner, {len(files)} Dateien")
+                details.append(f"✓ '{p}': {len(subdirs)} subdirectories, {len(files)} files")
             except Exception as e:
                 details.append(f"⚠️ '{p}' Lesefehler: {e}")
 
@@ -516,7 +883,7 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
                 name = vf.get("Name", "Unbenannt")
                 locations = vf.get("Locations", [])
                 loc_txt = ", ".join(locations) if locations else "Standardpfad"
-                scanned_folders.append(f"🎬 Jellyfin Mediathek: '{name}' [{loc_txt}]")
+                scanned_folders.append(f"🎬 Jellyfin Library: '{name}' [{loc_txt}]")
     except Exception as e:
         print(f"[Jellyfin VirtualFolders Warnung] {e}")
 
@@ -524,7 +891,7 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
         params = {
             "IncludeItemTypes": item_types,
             "Recursive": "true",
-            "Fields": "Path,ProductionYear,OriginalTitle,ImageTags,PrimaryImageAspectRatio",
+            "Fields": "Path,ProductionYear,OriginalTitle,ImageTags,PrimaryImageAspectRatio,ProviderIds",
             "EnableTotalRecordCount": "true",
             "api_key": api_key.strip()
         }
@@ -542,6 +909,10 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
             seen_ids.add(item_id)
 
             has_image = bool(item.get("ImageTags", {}).get("Primary"))
+            p_ids = item.get("ProviderIds") or {}
+            tmdb_id = p_ids.get("Tmdb") or p_ids.get("TmdbCollection")
+            imdb_id = p_ids.get("Imdb")
+            tvdb_id = p_ids.get("Tvdb")
 
             if item_type == "BoxSet":
                 if filter_type and filter_type != "Collection":
@@ -557,7 +928,10 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
                     "original_title": item.get("OriginalTitle") or "",
                     "year": item.get("ProductionYear"),
                     "dir": str(col_dir),
-                    "has_poster": has_image
+                    "has_poster": has_image,
+                    "tmdb_id": tmdb_id,
+                    "imdb_id": imdb_id,
+                    "tvdb_id": tvdb_id
                 })
                 continue
 
@@ -582,11 +956,14 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
                 "year": item.get("ProductionYear"),
                 "dir": str(target_dir),
                 "raw_path": raw_path,
-                "has_poster": has_image
+                "has_poster": has_image,
+                "tmdb_id": tmdb_id,
+                "imdb_id": imdb_id,
+                "tvdb_id": tvdb_id
             })
     except Exception as e:
         print(f"[Jellyfin Fetch Fehler] {e}")
-        scanned_folders.append(f"❌ Jellyfin Fehler beim Einlesen: {e}")
+        scanned_folders.append(f"❌ Jellyfin Fetch Error: {e}")
 
     return results, scanned_folders
 
@@ -605,11 +982,11 @@ def fetch_plex_items(url: str, token: str, filter_type: Optional[str] = None) ->
         for directory in data.get("Directory", []):
             sec_id = directory.get("key")
             sec_type = directory.get("type")
-            sec_title = directory.get("title", "Mediathek")
+            sec_title = directory.get("title", "Library")
             if sec_type not in ("movie", "show"):
                 continue
 
-            scanned_folders.append(f"🍿 Plex Mediathek: '{sec_title}' ({sec_type})")
+            scanned_folders.append(f"🍿 Plex Library: '{sec_title}' ({sec_type})")
             items_resp = requests.get(f"{url}/library/sections/{sec_id}/all", headers=headers, timeout=25)
             items_data = items_resp.json().get("MediaContainer", {})
 
@@ -678,6 +1055,23 @@ def build_search_queries(item: dict) -> List[str]:
     itype = item["type"]
     queries = []
 
+    st_info = discover_soundtrack_info(item)
+    composer = st_info.get("composer", "")
+    exact_song = st_info.get("title", "")
+    direct_url = st_info.get("direct_url", "")
+
+    if direct_url:
+        queries.append(direct_url)
+
+    if composer and exact_song:
+        queries.append(f"ytsearch8:{composer} {exact_song} {title} Official Soundtrack")
+        queries.append(f"ytsearch6:{composer} {exact_song} Official Audio")
+    elif composer:
+        queries.append(f"ytsearch8:{composer} {title} Soundtrack Main Theme")
+        queries.append(f"ytsearch6:{composer} {orig or title} Score")
+    elif exact_song:
+        queries.append(f"ytsearch8:{title} {exact_song} Soundtrack Theme")
+
     if itype == "Serie":
         queries.append(f"ytsearch8:{title} Opening Theme Song Soundtrack")
         queries.append(f"ytsearch6:{title} Titelmelodie Instrumental")
@@ -725,6 +1119,7 @@ def find_all_candidates(search_expr: str, blacklist: List[str], min_dur: int, ma
             vid_id = entry.get("id", "")
             vid_title = entry.get("title", "")
             duration = entry.get("duration") or 0
+            uploader = entry.get("uploader") or entry.get("channel") or ""
             url = entry.get("url") or entry.get("webpage_url") or (
                 f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""
             )
@@ -737,7 +1132,13 @@ def find_all_candidates(search_expr: str, blacklist: List[str], min_dur: int, ma
             if any(bad in lower_title for bad in EXCLUDE_KEYWORDS):
                 continue
 
-            candidates.append({"id": vid_id or url, "url": url, "title": vid_title, "duration": duration})
+            candidates.append({
+                "id": vid_id or url,
+                "url": url,
+                "title": vid_title,
+                "duration": duration,
+                "uploader": uploader
+            })
     except Exception:
         pass
     return candidates
@@ -805,7 +1206,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
     if is_direct_url:
         candidates = [{"url": custom_query_or_url, "title": "Manueller Link", "id": custom_query_or_url, "duration": 180}]
     else:
-        scan_progress["item_status"][item_id] = {"status": "searching", "percent": 20, "step": "Suche Soundtrack..."}
+        scan_progress["item_status"][item_id] = {"status": "searching", "percent": 20, "step": "Searching soundtrack..."}
         search_list = (
             [f"ytsearch8:{custom_query_or_url}", f"scsearch6:{custom_query_or_url}"]
             if custom_query_or_url
@@ -819,15 +1220,15 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
                     break
 
     if not candidates:
-        scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": "Kein Soundtrack gefunden"}
-        return {"ok": False, "msg": "Keine reine Titelmusik gefunden (nur Trailer/Szenen oder keine Treffer)"}
+        scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": "No soundtrack found"}
+        return {"ok": False, "msg": "No clean theme music found (only trailers/scenes or no matches)"}
 
     last_err = ""
     for idx, chosen_video in enumerate(candidates, 1):
         scan_progress["item_status"][item_id] = {
             "status": "downloading",
             "percent": int(30 + (idx / len(candidates)) * 40),
-            "step": f"Lade ({idx}/{len(candidates)}): {chosen_video['title'][:35]}..."
+            "step": f"Downloading ({idx}/{len(candidates)}): {chosen_video['title'][:35]}..."
         }
 
         dl_cmd = [
@@ -842,19 +1243,19 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         try:
             res = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
             if res.returncode != 0:
-                err_line = res.stderr.strip().splitlines()[-1] if res.stderr else "Fehler"
+                err_line = res.stderr.strip().splitlines()[-1] if res.stderr else "Error"
                 last_err = err_line[:80]
                 blacklist.append(chosen_video["id"])
                 continue
 
             downloaded = target_dir / "theme_temp.mp3"
             if downloaded.exists() and downloaded.stat().st_size > 1024:
-                scan_progress["item_status"][item_id] = {"status": "processing", "percent": 85, "step": "Schneide Audio (Fade-In/Out)..."}
+                scan_progress["item_status"][item_id] = {"status": "processing", "percent": 85, "step": "Mastering audio (Fade-in/out)..."}
 
                 post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade)
                 sync_collection_theme(item, output_mp3, jf_meta_base)
 
-                scan_progress["item_status"][item_id] = {"status": "done", "percent": 100, "step": "Erfolgreich geladen!"}
+                scan_progress["item_status"][item_id] = {"status": "done", "percent": 100, "step": "Successfully downloaded!"}
                 return {
                     "ok": True,
                     "video_id": chosen_video["id"],
@@ -864,8 +1265,8 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             last_err = str(e)
             continue
 
-    scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": f"Fehler: {last_err[:40]}"}
-    return {"ok": False, "msg": f"Alle Treffer fehlgeschlagen ({last_err[:60]})"}
+    scan_progress["item_status"][item_id] = {"status": "failed", "percent": 100, "step": f"Error: {last_err[:40]}"}
+    return {"ok": False, "msg": f"All candidates failed ({last_err[:60]})"}
 
 
 def run_scan(scope: str = "all"):
@@ -877,8 +1278,10 @@ def run_scan(scope: str = "all"):
     stop_requested = False
     scan_progress["is_running"] = True
     scan_progress["action_type"] = "scan"
-    scope_name = "alle Medien" if scope == "all" else (f"{scope}e" if scope == "Film" else f"{scope}n")
-    scan_progress["current_step"] = f"Lese {scope_name} ein..."
+    cfg = load_config()
+    scope_key = "all_media" if scope == "all" else ("movies_plural" if scope in ("Movie", "Film") else ("shows_plural" if scope in ("Serie", "Series") else "collections_plural"))
+    scope_name = get_t(cfg, scope_key)
+    scan_progress["current_step"] = get_t(cfg, "scanning", scope=scope_name)
     scan_progress["processed"] = 0
     scan_progress["total"] = 0
     scan_progress["percent"] = 0
@@ -896,7 +1299,7 @@ def run_scan(scope: str = "all"):
         jf_slugs = set()
 
         if cfg.get("jellyfin_url") and cfg.get("jellyfin_api_key"):
-            scan_progress["current_step"] = f"Lese Jellyfin ({scope_name}) ein..."
+            scan_progress["current_step"] = get_t(cfg, "fetching_jf", scope=scope_name)
             jf_items, jf_folders = fetch_jellyfin_items(cfg.get("jellyfin_url", ""), cfg.get("jellyfin_api_key", ""), filter_type=filter_type)
             raw_items.extend(jf_items)
             all_scanned_folders.extend(jf_folders)
@@ -907,7 +1310,7 @@ def run_scan(scope: str = "all"):
                     jf_slugs.add(it["dir"])
 
         if cfg.get("plex_url") and cfg.get("plex_token"):
-            scan_progress["current_step"] = f"Lese Plex ({scope_name}) ein..."
+            scan_progress["current_step"] = get_t(cfg, "fetching_plex", scope=scope_name)
             plex_items, plex_folders = fetch_plex_items(cfg.get("plex_url", ""), cfg.get("plex_token", ""), filter_type=filter_type)
             raw_items.extend(plex_items)
             all_scanned_folders.extend(plex_folders)
@@ -918,7 +1321,7 @@ def run_scan(scope: str = "all"):
                     jf_slugs.add(it["dir"])
 
         if cfg.get("local_scan_enabled", True):
-            scan_progress["current_step"] = f"Prüfe lokale Ordner ({scope_name})..."
+            scan_progress["current_step"] = get_t(cfg, "scanning_local", scope=scope_name)
             loc_items, loc_folders = scan_local_folders(
                 cfg.get("local_media_paths", "/media"),
                 filter_type=filter_type,
@@ -936,7 +1339,7 @@ def run_scan(scope: str = "all"):
         unified_items = {}
         source_prio = {"Jellyfin": 3, "Plex": 2, "Lokal": 1}
 
-        # Falls Scope-spezifisch: Behalte bestehende Items anderer Kategorien unangetastet!
+        # Behalte Items anderer Kategorien unangetastet!
         existing_other = {}
         existing_same = {}
         for k, v in state.get("items", {}).items():
@@ -974,7 +1377,7 @@ def run_scan(scope: str = "all"):
 
         for idx, it in enumerate(items_to_process, 1):
             if stop_requested:
-                scan_progress["current_step"] = "Scan abgebrochen!"
+                scan_progress["current_step"] = get_t(cfg, "scan_cancelled")
                 break
 
             item_id = it["id"]
@@ -992,12 +1395,12 @@ def run_scan(scope: str = "all"):
                 sync_collection_theme(it, mp3_file, jf_meta)
 
             if theme_exists:
-                status_txt = it.get("video_title") or existing.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
-                scan_progress["item_status"][item_id] = {"status": "ok", "percent": 100, "step": "Vorhanden"}
+                status_txt = it.get("video_title") or existing.get("video_title") or (mp3_file.name if mp3_file else "Present")
+                scan_progress["item_status"][item_id] = {"status": "ok", "percent": 100, "step": "Present"}
             else:
                 prev_status = existing.get("status", "")
-                status_txt = prev_status if prev_status and prev_status != "Vorhanden" else "Fehlt"
-                scan_progress["item_status"][item_id] = {"status": "missing", "percent": 0, "step": "Fehlt"}
+                status_txt = prev_status if prev_status and prev_status not in ("Vorhanden", "Present") else "Missing"
+                scan_progress["item_status"][item_id] = {"status": "missing", "percent": 0, "step": "Missing"}
 
             record = {
                 **existing,
@@ -1015,9 +1418,9 @@ def run_scan(scope: str = "all"):
 
         save_state(state)
         if not stop_requested:
-            scan_progress["current_step"] = f"Scan abgeschlossen: {total_items} {scope_name} erfasst."
+            scan_progress["current_step"] = get_t(cfg, "scan_complete", count=total_items, scope=scope_name)
     except Exception as e:
-        scan_progress["current_step"] = f"Fehler beim Scan: {e}"
+        scan_progress["current_step"] = get_t(cfg, "scan_error", err=e)
     finally:
         scan_progress["is_running"] = False
 
@@ -1031,7 +1434,7 @@ def run_download_queue(scope: str = "all"):
     stop_requested = False
     scan_progress["is_running"] = True
     scan_progress["action_type"] = "download"
-    scan_progress["current_step"] = "Initialisiere Download-Warteschlange..."
+    scan_progress["current_step"] = "Initializing download queue..."
     scan_progress["processed"] = 0
     scan_progress["percent"] = 0
     scan_progress["new_downloaded"] = 0
@@ -1057,14 +1460,14 @@ def run_download_queue(scope: str = "all"):
         scan_progress["total"] = total_missing
 
         if total_missing == 0:
-            scan_progress["current_step"] = "Keine fehlenden Themes in dieser Kategorie!"
+            scan_progress["current_step"] = get_t(cfg, "no_missing")
             return
 
         scan_progress["queue"] = [it["title"] for it in missing_items]
 
         for idx, it in enumerate(missing_items, 1):
             if stop_requested:
-                scan_progress["current_step"] = "Download abgebrochen!"
+                scan_progress["current_step"] = get_t(cfg, "download_cancelled")
                 break
 
             item_id = it["id"]
@@ -1092,9 +1495,9 @@ def run_download_queue(scope: str = "all"):
                 it["has_theme"] = True
                 it["video_id"] = dl_res["video_id"]
                 it["video_title"] = dl_res["video_title"]
-                it["status"] = dl_res["video_title"] or "Heruntergeladen"
+                it["status"] = dl_res["video_title"] or "Downloaded"
                 scan_progress["new_downloaded"] += 1
-                scan_progress["recent_finished"].insert(0, {"title": title, "ok": True, "msg": dl_res["video_title"] or "Geladen"})
+                scan_progress["recent_finished"].insert(0, {"title": title, "ok": True, "msg": dl_res["video_title"] or "Downloaded"})
             else:
                 it["status"] = dl_res["msg"]
                 scan_progress["failed"] += 1
@@ -1106,9 +1509,9 @@ def run_download_queue(scope: str = "all"):
             save_state(state)
 
         if not stop_requested:
-            scan_progress["current_step"] = f"Download fertig! {scan_progress['new_downloaded']} geladen, {scan_progress['failed']} fehlgeschlagen."
+            scan_progress["current_step"] = get_t(cfg, "download_complete", down=scan_progress["new_downloaded"], fail=scan_progress["failed"])
     except Exception as e:
-        scan_progress["current_step"] = f"Fehler beim Download: {e}"
+        scan_progress["current_step"] = get_t(cfg, "download_error", err=e)
     finally:
         scan_progress["is_running"] = False
         scan_progress["current_item_id"] = ""
@@ -1116,19 +1519,14 @@ def run_download_queue(scope: str = "all"):
 
 @app.get("/poster/{item_id}")
 def get_poster(item_id: str):
+    """Liefert das hochauflösende Cover: Erst per Jellyfin-API, dann tolerante lokale Metadaten-Erkennung"""
     state = load_state()
     cfg = load_config()
     item = state["items"].get(item_id)
     if not item:
         raise HTTPException(status_code=404)
 
-    p = Path(item.get("dir", ""))
-    if p.exists() and p.is_dir():
-        for fname in ("poster.jpg", "folder.jpg", "cover.jpg", "show.jpg", "poster.png", "folder.png"):
-            img_file = p / fname
-            if img_file.exists():
-                return FileResponse(img_file)
-
+    # 1. Prio: Jellyfin Primary Image API (funktioniert immer unabhängig von Festplatten-Dateinamen!)
     if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
         jf_url = cfg["jellyfin_url"]
         raw_id = item["jf_raw_id"]
@@ -1141,14 +1539,34 @@ def get_poster(item_id: str):
                 r = requests.get(
                     img_url,
                     headers=headers,
-                    params={"maxWidth": "160", "quality": "85", "api_key": api_key},
-                    timeout=4
+                    params={"fillWidth": "240", "quality": "90", "api_key": api_key},
+                    timeout=5
                 )
-                if r.status_code == 200 and len(r.content) > 100:
-                    return Response(content=r.content, media_type=r.headers.get("Content-Type", "image/jpeg"))
+                if r.status_code == 200 and len(r.content) > 500:
+                    ct = r.headers.get("Content-Type", "image/jpeg")
+                    return Response(content=r.content, media_type=ct)
             except Exception:
                 pass
 
+    # 2. Prio: Plex Thumbnail
+    if item.get("source") == "Plex" and item.get("plex_thumb") and cfg.get("plex_url"):
+        plex_url = cfg["plex_url"]
+        token = cfg.get("plex_token", "").strip()
+        try:
+            r = requests.get(f"{plex_url}{item['plex_thumb']}", headers={"X-Plex-Token": token}, timeout=5)
+            if r.status_code == 200 and len(r.content) > 500:
+                ct = r.headers.get("Content-Type", "image/jpeg")
+                return Response(content=r.content, media_type=ct)
+        except Exception:
+            pass
+
+    # 3. Prio: Lokale Festplatten-Erkennung (Hochformat & flexible Dateinamen)
+    p = Path(item.get("dir", ""))
+    cover_file = find_local_cover_image(p, title=item.get("title", ""))
+    if cover_file and cover_file.exists():
+        return FileResponse(cover_file)
+
+    # 4. Fallback: Saubere SVG-Initialen
     initial = (item.get("title") or "?")[0].upper()
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="90" viewBox="0 0 60 90">
         <rect width="100%" height="100%" fill="#262a32" rx="4"/>
@@ -1171,6 +1589,80 @@ def stream_audio(item_id: str):
     return FileResponse(mp3_file, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
 
 
+@app.get("/api/candidate-stream")
+def candidate_stream(v: str):
+    """Extrahiert direkte Audio-Stream-URL via yt-dlp für schnelles Vorhören ohne Download"""
+    target = f"https://www.youtube.com/watch?v={v}" if not v.startswith("http") else v
+    try:
+        cmd = ["yt-dlp", "-g", "-f", "ba[ext=m4a]/ba/b", target]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        if res.returncode == 0 and res.stdout.strip():
+            direct_url = res.stdout.strip().splitlines()[0]
+            return RedirectResponse(direct_url)
+    except Exception:
+        pass
+    raise HTTPException(status_code=404, detail="Audio-Stream konnte nicht geladen werden")
+
+
+@app.get("/api/theme-candidates/{item_id}")
+def api_theme_candidates(item_id: str, q: Optional[str] = None):
+    """Liefert die Top 5-8 Theme-Vorschläge inklusive Spürhund-Metadaten für das Auswahl-Modal"""
+    state = load_state()
+    cfg = load_config()
+    item = state["items"].get(item_id)
+    if not item:
+        return {"ok": False, "msg": "Eintrag nicht gefunden", "candidates": []}
+
+    blacklist = state.get("blacklist", {}).get(item_id, [])
+    min_dur = cfg.get("min_duration_sec", 20)
+    max_dur = cfg.get("max_duration_sec", 360)
+
+    st_info = discover_soundtrack_info(item)
+
+    if q and q.strip():
+        search_exprs = [f"ytsearch8:{q.strip()}", f"scsearch5:{q.strip()}"]
+    else:
+        search_exprs = build_search_queries(item)
+
+    all_found = []
+    seen_ids = set()
+
+    if not q and st_info.get("direct_url"):
+        direct_u = st_info["direct_url"]
+        seen_ids.add(direct_u)
+        all_found.append({
+            "id": direct_u,
+            "url": direct_u,
+            "title": f"🎯 [Offiziell] {st_info.get('display') or 'Theme'}",
+            "duration": 180,
+            "duration_str": "~03:00",
+            "uploader": st_info.get("source", "Community-DB")
+        })
+
+    for expr in search_exprs:
+        if expr.startswith("http"):
+            continue
+        cands = find_all_candidates(expr, blacklist, min_dur, max_dur)
+        for c in cands:
+            cid = c.get("id")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                dur = c.get("duration") or 0
+                dur_str = f"{int(dur // 60):02d}:{int(dur % 60):02d}" if dur else "-:--"
+                c["duration_str"] = dur_str
+                all_found.append(c)
+        if len(all_found) >= 6:
+            break
+
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "title": item.get("title", ""),
+        "soundtrack_info": st_info,
+        "candidates": all_found[:8]
+    }
+
+
 @app.get("/api/progress")
 def get_progress():
     return scan_progress
@@ -1180,8 +1672,8 @@ def get_progress():
 def cancel_action():
     global stop_requested, scan_progress
     stop_requested = True
-    scan_progress["current_step"] = "Abbruch angefordert..."
-    return {"ok": True, "msg": "Abbruch angefordert"}
+    scan_progress["current_step"] = "Cancelling..."
+    return {"ok": True, "msg": "Cancellation requested"}
 
 
 @app.post("/scan")
@@ -1225,11 +1717,11 @@ def scan_single(
     item["dir"] = actual_dir
     item["has_theme"] = theme_exists
     if theme_exists:
-        item["status"] = item.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
+        item["status"] = item.get("video_title") or (mp3_file.name if mp3_file else "Present")
         if item.get("type") == "Collection" and mp3_file:
             sync_collection_theme(item, mp3_file, cfg.get("jf_metadata_dir", "/jellyfin-metadata"))
     else:
-        item["status"] = "Fehlt"
+        item["status"] = "Missing"
 
     state["items"][item_id] = item
     save_state(state)
@@ -1299,7 +1791,7 @@ def delete_theme(
         if old_vid:
             state["blacklist"].setdefault(item_id, []).append(old_vid)
         item["has_theme"] = False
-        item["status"] = "Gelöscht (geblockt)"
+        item["status"] = "Deleted (blocked)"
         save_state(state)
 
     clean_tab = normalize_tab(tab)
@@ -1330,6 +1822,15 @@ def api_test_folder(data: TestFolderReq):
     return test_folder_path(data.paths)
 
 
+
+@app.get("/set-language")
+def set_language(lang: str = "en", tab: str = "movies", filter_status: str = "all", q: str = ""):
+    cfg = load_config()
+    cfg["ui_language"] = "de" if lang == "de" else "en"
+    save_config(cfg)
+    clean_tab = normalize_tab(tab)
+    return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
+
 @app.get("/settings", response_class=HTMLResponse)
 def get_settings_page():
     cfg = load_config()
@@ -1339,7 +1840,7 @@ def get_settings_page():
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Einstellungen • Theme Fetcher</title>
+        <title>{get_t(cfg, "settings_title")} • Theme Fetcher</title>
         <style>
             :root {{
                 --bg: #121417;
@@ -1377,88 +1878,101 @@ def get_settings_page():
     </head>
     <body>
         <div class="nav-back">
-            <a href="/">← Zurück zur Mediathek</a>
+            <a href="/">{get_t(cfg, "back_to_lib")}</a>
         </div>
-        <h1>⚙️ Einstellungen & Quellen</h1>
+        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v19</span></h1>
 
         <form method="post" action="/settings">
             <div class="card">
                 <h2>
-                    <span>📁 1. Lokale Medienquellen (Festplatte)</span>
-                    <button type="button" class="test" onclick="runTestFolder()">📂 Pfad testen</button>
+                    <span>{get_t(cfg, "sec_local")}</span>
+                    <button type="button" class="test" onclick="runTestFolder()">{get_t(cfg, "btn_test_path")}</button>
                 </h2>
                 <div class="form-grid">
                     <div class="form-group" style="grid-column: 1 / -1;">
-                        <label>Medienpfad(e) im Container</label>
+                        <label>{get_t(cfg, "lbl_paths")}</label>
                         <input type="text" id="cfg_paths" name="local_media_paths" value="{cfg.get('local_media_paths', '/media')}">
-                        <small>Standard: <code>/media</code>. Entspricht deinem Docker Volume Mount.</small>
+                        <small>{get_t(cfg, "sub_paths")}</small>
                         <div id="res_folder" class="test-result"></div>
                     </div>
                     <div class="checkbox-group" style="grid-column: 1 / -1;">
                         <input type="checkbox" id="local_scan_enabled" name="local_scan_enabled" {'checked' if cfg.get('local_scan_enabled', True) else ''}>
-                        <label for="local_scan_enabled">Lokalen Festplatten-Scan aktivieren (wird automatisch dedupliziert)</label>
+                        <label for="local_scan_enabled">{get_t(cfg, "lbl_local_scan")}</label>
                     </div>
                 </div>
             </div>
 
             <div class="card">
                 <h2>
-                    <span>🎬 2. Medienserver (Jellyfin / Plex)</span>
+                    <span>{get_t(cfg, "sec_servers")}</span>
                     <div style="display:flex; gap:6px;">
-                        <button type="button" class="test" onclick="runTestJellyfin()">🔌 Jellyfin testen</button>
-                        <button type="button" class="test" onclick="runTestPlex()">🍿 Plex testen</button>
+                        <button type="button" class="test" onclick="runTestJellyfin()">{get_t(cfg, "btn_test_jf")}</button>
+                        <button type="button" class="test" onclick="runTestPlex()">{get_t(cfg, "btn_test_plex")}</button>
                     </div>
                 </h2>
                 <div class="form-grid">
                     <div class="form-group">
-                        <label>Jellyfin Server-IP & Port</label>
+                        <label>{get_t(cfg, "lbl_jf_url")}</label>
                         <input type="text" id="cfg_jf_url" name="jellyfin_url" value="{cfg.get('jellyfin_url', '')}">
-                        <small>Standard-Port: <strong>8096</strong> (z. B. <code>192.168.178.50:8096</code>)</small>
+                        <small>{get_t(cfg, "sub_jf_url")}</small>
                     </div>
                     <div class="form-group">
-                        <label>Jellyfin API-Key</label>
+                        <label>{get_t(cfg, "lbl_jf_key")}</label>
                         <input type="text" id="cfg_jf_key" name="jellyfin_api_key" value="{cfg.get('jellyfin_api_key', '')}">
-                        <small>Erstellt unter Jellyfin: Dashboard ➔ API-Schlüssel</small>
+                        <small>{get_t(cfg, "sub_jf_key")}</small>
                     </div>
                     <div id="res_jf" class="test-result" style="grid-column: 1 / -1;"></div>
 
                     <div class="form-group">
-                        <label>Plex Server-IP & Port (Optional)</label>
+                        <label>{get_t(cfg, "lbl_plex_url")}</label>
                         <input type="text" id="cfg_plex_url" name="plex_url" value="{cfg.get('plex_url', '')}">
-                        <small>Standard-Port: <strong>32400</strong> (z. B. <code>192.168.178.50:32400</code>)</small>
+                        <small>{get_t(cfg, "sub_plex_url")}</small>
                     </div>
                     <div class="form-group">
-                        <label>Plex Token (Optional)</label>
+                        <label>{get_t(cfg, "lbl_plex_token")}</label>
                         <input type="text" id="cfg_plex_token" name="plex_token" value="{cfg.get('plex_token', '')}">
-                        <small>Dein persönlicher X-Plex-Token</small>
+                        <small>{get_t(cfg, "sub_plex_token")}</small>
                     </div>
                     <div id="res_plex" class="test-result" style="grid-column: 1 / -1;"></div>
                 </div>
             </div>
 
             <div class="card">
-                <h2>⚡ 3. Download-Kriterien & Audio-Veredelung</h2>
+                <h2>{get_t(cfg, "sec_audio")}</h2>
                 <div class="form-grid">
                     <div class="form-group">
-                        <label>Min. Titellänge (Sekunden)</label>
+                        <label>{get_t(cfg, "lbl_min_dur")}</label>
                         <input type="number" name="min_duration_sec" value="{cfg.get('min_duration_sec', 25)}">
-                        <small>Verhindert Jingles und kurze Soundeffekte (Standard: 25s)</small>
+                        <small>{get_t(cfg, "sub_min_dur")}</small>
                     </div>
                     <div class="form-group">
-                        <label>Max. Titellänge (Sekunden)</label>
+                        <label>{get_t(cfg, "lbl_max_dur")}</label>
                         <input type="number" name="max_duration_sec" value="{cfg.get('max_duration_sec', 270)}">
-                        <small>Verhindert ganze Alben und Loops (Standard: 270s)</small>
+                        <small>{get_t(cfg, "sub_max_dur")}</small>
                     </div>
                     <div class="checkbox-group">
                         <input type="checkbox" id="audio_fade" name="audio_fade" {'checked' if cfg.get('audio_fade', True) else ''}>
-                        <label for="audio_fade"><strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s sanft anblenden, 3s ausblenden</label>
+                        <label for="audio_fade">{get_t(cfg, "lbl_fade")}</label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2><span>{get_t(cfg, "sec_lang")}</span></h2>
+                <div class="form-grid">
+                    <div class="form-group" style="grid-column: 1 / -1;">
+                        <label>{get_t(cfg, "lbl_lang")}</label>
+                        <select name="ui_language" style="padding: 8px 12px; font-size: 0.95rem; width: 220px;">
+                            <option value="de" {'selected' if cfg.get('ui_language', 'de') == 'de' else ''}>🇩🇪 Deutsch (German)</option>
+                            <option value="en" {'selected' if cfg.get('ui_language', 'de') == 'en' else ''}>🇬🇧 English</option>
+                        </select>
                     </div>
                 </div>
             </div>
 
             <div style="margin-top:20px; display:flex; gap:12px;">
-                <button type="submit" style="background:#28a745; font-size:1.05rem; padding:12px 24px;">💾 Einstellungen speichern & anwenden</button>
-                <a href="/" class="btn" style="background:#2a2e36;">Abbrechen</a>
+                <button type="submit" style="background:#28a745; font-size:1.05rem; padding:12px 24px;">{get_t(cfg, "btn_save_settings")}</button>
+                <a href="/" class="btn" style="background:#2a2e36;">{get_t(cfg, "btn_cancel_settings")}</a>
             </div>
         </form>
 
@@ -1467,7 +1981,7 @@ def get_settings_page():
                 const resEl = document.getElementById('res_jf');
                 resEl.className = 'test-result';
                 resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Verbindung zu Jellyfin...';
+                resEl.innerText = 'Testing connection to Jellyfin...';
                 
                 const url = document.getElementById('cfg_jf_url').value;
                 const apiKey = document.getElementById('cfg_jf_key').value;
@@ -1483,7 +1997,7 @@ def get_settings_page():
                     resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
                 }} catch (e) {{
                     resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                    resEl.innerText = '✕ Request failed: ' + e;
                 }}
             }}
 
@@ -1491,7 +2005,7 @@ def get_settings_page():
                 const resEl = document.getElementById('res_plex');
                 resEl.className = 'test-result';
                 resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Verbindung zu Plex...';
+                resEl.innerText = 'Testing connection to Plex...';
                 
                 const url = document.getElementById('cfg_plex_url').value;
                 const token = document.getElementById('cfg_plex_token').value;
@@ -1507,7 +2021,7 @@ def get_settings_page():
                     resEl.innerText = (data.ok ? '✓ ' : '✕ ') + data.msg;
                 }} catch (e) {{
                     resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                    resEl.innerText = '✕ Request failed: ' + e;
                 }}
             }}
 
@@ -1515,7 +2029,7 @@ def get_settings_page():
                 const resEl = document.getElementById('res_folder');
                 resEl.className = 'test-result';
                 resEl.style.display = 'block';
-                resEl.innerText = 'Prüfe Medienpfad im Container...';
+                resEl.innerText = 'Testing container media path...';
                 
                 const paths = document.getElementById('cfg_paths').value;
 
@@ -1530,7 +2044,7 @@ def get_settings_page():
                     resEl.innerText = data.msg;
                 }} catch (e) {{
                     resEl.className = 'test-result err';
-                    resEl.innerText = '✕ Anfrage fehlgeschlagen: ' + e;
+                    resEl.innerText = '✕ Request failed: ' + e;
                 }}
             }}
         </script>
@@ -1550,6 +2064,7 @@ def update_settings(
     min_duration_sec: int = Form(25),
     max_duration_sec: int = Form(270),
     audio_fade: Optional[str] = Form(None),
+    ui_language: str = Form("de"),
     scan_interval_hours: int = Form(12)
 ):
     cfg = load_config()
@@ -1562,6 +2077,7 @@ def update_settings(
     cfg["min_duration_sec"] = min_duration_sec
     cfg["max_duration_sec"] = max_duration_sec
     cfg["audio_fade"] = bool(audio_fade)
+    cfg["ui_language"] = ui_language.strip() or "de"
     cfg["scan_interval_hours"] = scan_interval_hours
 
     save_config(cfg)
@@ -1591,7 +2107,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
 
     scanned_folders = state.get("folders", [])
 
-    type_map = {"filme": "Film", "serien": "Serie", "collections": "Collection"}
+    type_map = {"movies": "Film", "shows": "Serie", "collections": "Collection", "filme": "Film", "serien": "Serie"}
     current_scope = type_map.get(clean_tab, "Film")
 
     tab_items = [i for i in all_items if i.get("type") == current_scope]
@@ -1611,11 +2127,16 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         items = [i for i in items if i.get("has_theme")]
 
     items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
+    st_cache = state.get("soundtrack_cache", {})
 
     rows = ""
     for it in items:
         iid = it["id"]
         has_theme = bool(it.get("has_theme"))
+        st_hint = ""
+        c_info = st_cache.get(iid)
+        if c_info and c_info.get("display"):
+            st_hint = f"<div style='font-size:0.75rem; color:#7db2ff; margin-top:2px;'>🎯 {c_info['display']} <span style='color:#8b929a;'>({c_info.get('source')})</span></div>"
         orig_hint = (
             f" <small style='color:#7d8590;'>[{it['original_title']}]</small>"
             if it.get("original_title") and it["original_title"].lower() != it["title"].lower()
@@ -1623,9 +2144,9 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         )
 
         badge = (
-            '<span class="badge ok">✓ Vorhanden</span>'
+            '<span class="badge ok">{get_t(cfg, "status_present")}</span>'
             if has_theme
-            else '<span class="badge miss">✕ Fehlt</span>'
+            else '<span class="badge miss">{get_t(cfg, "status_missing")}</span>'
         )
         player = (
             f'<audio controls preload="none" src="/audio/{iid}?t={int(time.time())}"></audio>'
@@ -1638,7 +2159,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             sub_info = f"<div style='font-size:0.75rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>"
         else:
             err_msg = it.get("status") or ""
-            if err_msg and err_msg != "Fehlt" and err_msg != "Vorhanden":
+            if err_msg and err_msg not in ("Fehlt", "Missing", "Vorhanden", "Present"):
                 sub_info = f"<div style='font-size:0.75rem; color:#ff8585; margin-top:3px;'>⚠️ {err_msg}</div>"
             else:
                 sub_info = ""
@@ -1651,6 +2172,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <td>
                 <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
                 <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
+                {st_hint}
             </td>
             <td>
                 <div id="status_box_{iid}">
@@ -1661,24 +2183,25 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <td>{player}</td>
             <td style="white-space: nowrap;">
                 <div style="display:inline-flex; gap:4px; align-items:center;">
+                    <button type="button" class="btn-sm" style="background:#5c3b99;" onclick="openThemeModal('{iid}')" title="{get_t(cfg, 'btn_select_title')}">{get_t(cfg, "btn_select")}</button>
                     <form method="post" action="/replace/{iid}" class="inline-form" onsubmit="this.querySelector('button').innerText='⏳';">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
                         <input type="hidden" name="q" value="{q}">
-                        <input type="text" name="custom_input" placeholder="YouTube URL / Begriff..." style="width:130px; font-size:0.8rem; padding:4px 6px;">
-                        <button type="submit" class="btn-sm" title="Jetzt suchen & laden">▶️ Laden</button>
+                        <input type="text" name="custom_input" placeholder="{get_t(cfg, 'btn_dl_placeholder')}" style="width:115px; font-size:0.8rem; padding:4px 6px;">
+                        <button type="submit" class="btn-sm" title="{get_t(cfg, 'btn_dl_title')}">▶️</button>
                     </form>
                     <form method="post" action="/scan-single/{iid}" style="display:inline;" onsubmit="this.querySelector('button').innerText='⏳';">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
                         <input type="hidden" name="q" value="{q}">
-                        <button type="submit" class="btn-sm secondary" title="Nur diesen Eintrag neu prüfen">🔄</button>
+                        <button type="submit" class="btn-sm secondary" title="{get_t(cfg, 'btn_recheck_title')}">🔄</button>
                     </form>
-                    <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('Theme löschen und sperren?');">
+                    <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('{del_confirm_msg}');">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
                         <input type="hidden" name="q" value="{q}">
-                        <button type="submit" class="btn-sm danger" title="Löschen & Blockieren">✕</button>
+                        <button type="submit" class="btn-sm danger" title="{get_t(cfg, 'btn_delete_title')}">✕</button>
                     </form>
                 </div>
             </td>
@@ -1687,17 +2210,17 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <div style="background:#262a32; height:8px; border-radius:4px; overflow:hidden; margin-bottom:4px;">
                         <div id="prog_bar_fill_{iid}" style="background:#28a745; height:100%; width:0%; transition:width 0.3s;"></div>
                     </div>
-                    <span id="prog_bar_txt_{iid}" style="color:#7db2ff; font-size:0.75rem;">Verarbeite...</span>
+                    <span id="prog_bar_txt_{iid}" style="color:#7db2ff; font-size:0.75rem;">Processing...</span>
                 </div>
-                <span id="prog_static_{iid}" style="color:#7d8590;">{'✓ Bereit' if has_theme else 'Fehlt'}</span>
+                <span id="prog_static_{iid}" style="color:#7d8590;">{'✓ Ready' if has_theme else 'Missing'}</span>
             </td>
         </tr>
         """
 
-    saved_banner = '<div class="banner">✓ Einstellungen gespeichert!</div>' if settings == "saved" else ""
-    folder_list_html = "".join(f"<li style='margin-bottom:6px;'><code>{f}</code></li>" for f in scanned_folders) or "<li>Bisher keine Bibliotheken erfasst. Klicke auf 'Mediathek scannen'!</li>"
+    saved_banner = f'<div class="banner">{get_t(cfg, "settings_saved_banner")}</div>' if settings == "saved" else ""
+    folder_list_html = "".join(f"<li style='margin-bottom:6px;'><code>{f}</code></li>" for f in scanned_folders) or "<li>{lib_empty_placeholder}</li>"
 
-    scope_label = "Filme" if current_scope == "Film" else ("Serien" if current_scope == "Serie" else "Collections")
+    scope_label = "Movies" if current_scope == "Film" else ("TV Shows" if current_scope == "Serie" else "Collections")
 
     return f"""
     <!doctype html>
@@ -1768,23 +2291,31 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             .pill.active {{ background: #2b7de9; color: #fff; border-color: #2b7de9; }}
             .pill.miss.active {{ background: #c93b3b; color: #fff; border-color: #c93b3b; }}
             .pill.ok.active {{ background: #28a745; color: #fff; border-color: #28a745; }}
+
+            /* MODAL DIALOG */
+            .modal-backdrop {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.75); display: none; align-items: center; justify-content: center; z-index: 1000; }}
+            .modal {{ background: var(--card-bg); border: 1px solid #343b47; border-radius: 10px; width: 92%; max-width: 680px; padding: 22px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); max-height: 90vh; overflow-y: auto; }}
+            .modal h2 {{ margin-top: 0; font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }}
+            .modal-close {{ background: transparent; color: var(--text-muted); border: none; font-size: 1.4rem; cursor: pointer; padding: 0 4px; }}
+            .modal-close:hover {{ color: #fff; }}
+            .candidate-row {{ background: #121417; border: 1px solid #282d37; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }}
         </style>
     </head>
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher</h1>
-                <div class="stats">Filme: {filme_ok}/{total_filme} • Serien: {serien_ok}/{total_serien} • Collections: {cols_ok}/{total_cols}</div>
+                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v19</span></h1>
+                <div class="stats">{get_t(cfg, "movies")}: {filme_ok}/{total_filme} • {get_t(cfg, "shows")}: {serien_ok}/{total_serien} • {get_t(cfg, "collections")}: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                <a href="/settings" class="btn secondary">⚙️ Einstellungen</a>
+                <div style="display:inline-flex; border:1px solid #343840; border-radius:6px; overflow:hidden; margin-right:4px;"><a href="/set-language?lang=en&tab={clean_tab}&filter_status={filter_status}&q={q}" style="padding:6px 10px; font-size:0.8rem; text-decoration:none; font-weight:600; background:('#2b7de9' if cfg.get('ui_language','en')=='en' else '#1e2126'); color:#fff;">🇬🇧 EN</a><a href="/set-language?lang=de&tab={clean_tab}&filter_status={filter_status}&q={q}" style="padding:6px 10px; font-size:0.8rem; text-decoration:none; font-weight:600; background:('#2b7de9' if cfg.get('ui_language','en')=='de' else '#1e2126'); color:#fff;">🇩🇪 DE</a></div><a href="/settings" class="btn secondary">⚙️ {get_t(cfg, "settings")}</a>
 
                 <form method="post" action="/scan" style="display:inline;">
                     <input type="hidden" name="scope" value="{current_scope}">
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
                     <input type="hidden" name="q" value="{q}">
-                    <button type="submit" title="Scannt ausschließlich {scope_label}">🔍 Nur {scope_label} scannen</button>
+                    <button type="submit">{get_t(cfg, "scan_only", scope=scope_label)}</button>
                 </form>
 
                 <form method="post" action="/scan" style="display:inline;">
@@ -1792,7 +2323,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
                     <input type="hidden" name="q" value="{q}">
-                    <button type="submit" class="secondary" title="Kompletten Scan über alle Kategorien ausführen">🌐 Alles scannen</button>
+                    <button type="submit" class="secondary">{get_t(cfg, "scan_all")}</button>
                 </form>
 
                 <form method="post" action="/download" style="display:inline;">
@@ -1800,10 +2331,10 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
                     <input type="hidden" name="q" value="{q}">
-                    <button type="submit" class="success" title="Lädt fehlende Themes für {scope_label}">⬇️ {scope_label} laden ({tab_miss})</button>
+                    <button type="submit" class="success">{get_t(cfg, "download_missing", scope=scope_label, count=tab_miss)}</button>
                 </form>
 
-                <button type="button" id="btnCancel" class="danger" style="display:none;" onclick="cancelRunningAction()">🛑 Abbrechen</button>
+                <button type="button" id="btnCancel" class="danger" style="display:none;" onclick="cancelRunningAction()">{get_t(cfg, "cancel")}</button>
             </div>
         </div>
 
@@ -1812,58 +2343,58 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         <!-- LIVE FORTSCHRITTS- & WARTESCHLANGEN-KARTE -->
         <div id="progressCard" class="progress-card" style="display:none;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-                <strong id="progStep" style="font-size:1.05rem;">Aktion läuft...</strong>
+                <strong id="progStep" style="font-size:1.05rem;">{get_t(cfg, "op_in_progress")}</strong>
                 <span id="progCount" style="color:var(--text-muted); font-size:0.95rem; font-weight:600;">0 / 0</span>
             </div>
             <div class="progress-bar-bg">
                 <div id="progFill" class="progress-bar-fill"></div>
             </div>
             <div style="display:flex; justify-content:space-between; font-size:0.85rem; color:var(--text-muted);">
-                <span id="progItem">Verarbeite...</span>
-                <span>Erfolgreich geladen: <strong id="progDown" style="color:#5ce69a;">0</strong> | Fehler: <strong id="progFail" style="color:#ff8585;">0</strong></span>
+                <span id="progItem">{get_t(cfg, "processing")}</span>
+                <span>{get_t(cfg, "downloaded_stat")}: <strong id="progDown" style="color:#5ce69a;">0</strong> | {get_t(cfg, "failed_stat")}: <strong id="progFail" style="color:#ff8585;">0</strong></span>
             </div>
 
             <div id="queueBox" class="queue-box" style="display:none;">
-                <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">📋 Nächste in der Download-Warteschlange:</div>
+                <div style="font-weight:600; margin-bottom:6px; color:#7db2ff;">{get_t(cfg, "next_in_queue")}</div>
                 <div id="queueList" style="color:var(--text-muted); font-size:0.8rem; margin-bottom:10px;">-</div>
-                <div style="font-weight:600; margin-bottom:4px; color:#5ce69a;">✓ Zuletzt abgeschlossen:</div>
+                <div style="font-weight:600; margin-bottom:4px; color:#5ce69a;">{get_t(cfg, "recently_finished")}</div>
                 <div id="recentList" style="font-size:0.8rem;">-</div>
             </div>
         </div>
 
         <!-- REITER / TABS -->
         <div class="tab-nav">
-            <a href="/?tab=filme&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='filme' else ''}">🎬 Filme ({filme_ok}/{total_filme})</a>
-            <a href="/?tab=serien&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='serien' else ''}">📺 Serien ({serien_ok}/{total_serien})</a>
-            <a href="/?tab=collections&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='collections' else ''}">📁 Collections ({cols_ok}/{total_cols})</a>
-            <a href="/?tab=ordner" class="tab-btn {'active' if clean_tab=='ordner' else ''}">📂 Eingelesene Mediatheken ({len(scanned_folders)})</a>
+            <a href="/?tab=movies&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab in ('movies', 'filme') else ''}">🎬 {get_t(cfg, "movies")} ({filme_ok}/{total_filme})</a>
+            <a href="/?tab=shows&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab in ('shows', 'serien') else ''}">📺 {get_t(cfg, "shows")} ({serien_ok}/{total_serien})</a>
+            <a href="/?tab=collections&filter_status={filter_status}{f'&q={q}' if q else ''}" class="tab-btn {'active' if clean_tab=='collections' else ''}">📁 {get_t(cfg, "collections")} ({cols_ok}/{total_cols})</a>
+            <a href="/?tab=libraries" class="tab-btn {'active' if clean_tab in ('libraries', 'ordner') else ''}">📂 {get_t(cfg, "libraries")} ({len(scanned_folders)})</a>
         </div>
 
-        {'<!-- ORDNER TAB -->' if clean_tab == 'ordner' else ''}
-        <div style="display: {'block' if clean_tab == 'ordner' else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
-            <h3 style="margin-top:0;">Gefundene Mediatheken & Verzeichnisse:</h3>
-            <p style="color:var(--text-muted); font-size:0.9rem;">Hier siehst du alle Mediatheken und Pfade, die Jellyfin und deine Festplatte gemeldet haben:</p>
+        {'<!-- ORDNER TAB -->' if clean_tab in ('libraries', 'ordner') else ''}
+        <div style="display: {'block' if clean_tab in ('libraries', 'ordner') else 'none'}; background:var(--card-bg); padding:20px; border-radius:8px;">
+            <h3 style="margin-top:0;">{get_t(cfg, "lib_title")}</h3>
+            <p style="color:var(--text-muted); font-size:0.9rem;">{get_t(cfg, "lib_desc")}</p>
             <ul style="line-height:1.8; font-size:0.95rem;">
                 {folder_list_html}
             </ul>
         </div>
 
         <!-- FILTER-LEISTE & TABELLE -->
-        <div style="display: {'none' if clean_tab == 'ordner' else 'block'};">
+        <div style="display: {'none' if clean_tab in ('libraries', 'ordner') else 'block'};">
             <div style="background:var(--card-bg); padding:12px; border-radius:8px; margin-bottom:14px; display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
                 
                 <div class="pill-filter">
-                    <span style="font-size:0.85rem; color:var(--text-muted); margin-right:4px;">Filter:</span>
-                    <a href="/?tab={clean_tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">Alle ({tab_total})</a>
-                    <a href="/?tab={clean_tab}&filter_status=missing{f'&q={q}' if q else ''}" class="pill miss {'active' if filter_status=='missing' else ''}">❌ Fehlt ({tab_miss})</a>
-                    <a href="/?tab={clean_tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">✓ Vorhanden ({tab_ok})</a>
+                    <span style="font-size:0.85rem; color:var(--text-muted); margin-right:4px;">{get_t(cfg, "filter_label")}</span>
+                    <a href="/?tab={clean_tab}&filter_status=all{f'&q={q}' if q else ''}" class="pill {'active' if filter_status=='all' else ''}">{get_t(cfg, "all_pill", count=tab_total)}</a>
+                    <a href="/?tab={clean_tab}&filter_status=missing{f'&q={q}' if q else ''}" class="pill miss {'active' if filter_status=='missing' else ''}">{get_t(cfg, "missing_pill", count=tab_miss)}</a>
+                    <a href="/?tab={clean_tab}&filter_status=ok{f'&q={q}' if q else ''}" class="pill ok {'active' if filter_status=='ok' else ''}">{get_t(cfg, "present_pill", count=tab_ok)}</a>
                 </div>
 
                 <form method="get" action="/" style="display:flex; gap:6px; align-items:center;">
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
-                    <input type="text" name="q" value="{q}" placeholder="{scope_label} durchsuchen..." style="width:200px;">
-                    <button type="submit" class="btn-sm">Suchen</button>
+                    <input type="text" name="q" value="{q}" placeholder="{get_t(cfg, 'search_placeholder', scope=scope_label)}" style="width:200px;">
+                    <button type="submit" class="btn-sm">{get_t(cfg, "search_btn")}</button>
                     {f'<a href="/?tab={clean_tab}&filter_status={filter_status}" class="btn-sm secondary">✕</a>' if q else ''}
                 </form>
             </div>
@@ -1871,21 +2402,47 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <table>
                 <thead>
                     <tr>
-                        <th style="width:50px;">Cover</th>
-                        <th>Titel & Pfad</th>
-                        <th>Status</th>
-                        <th>Vorschau</th>
-                        <th>Aktionen</th>
-                        <th>Fortschritt</th>
+                        <th style="width:50px;">{get_t(cfg, "th_cover")}</th>
+                        <th>{get_t(cfg, "th_title_path")}</th>
+                        <th>{get_t(cfg, "th_status")}</th>
+                        <th>{get_t(cfg, "th_preview")}</th>
+                        <th>{get_t(cfg, "th_actions")}</th>
+                        <th>{get_t(cfg, "th_progress")}</th>
                     </tr>
                 </thead>
-                <tbody>{rows or f'<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-muted);">Keine Einträge unter {scope_label} gefunden.</td></tr>'}</tbody>
+                <tbody>{rows or f'<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-muted);">{get_t(cfg, "no_entries", scope=scope_label)}</td></tr>'}</tbody>
             </table>
         </div>
 
+        <!-- THEME AUSWAHL-MODAL -->
+        <div id="themeModal" class="modal-backdrop">
+            <div class="modal">
+                <h2>
+                    <span id="themeModalTitle">{get_t(cfg, "modal_title", title="")}</span>
+                    <button class="modal-close" onclick="closeModal('themeModal')">&times;</button>
+                </h2>
+                
+                <div id="themeSpuerhundBanner" style="display:none; background:#192636; border:1px solid #2b4566; color:#7db2ff; padding:8px 12px; border-radius:6px; margin: 10px 0; font-size:0.85rem;"></div>
+
+                <div style="display:flex; gap:6px; margin: 12px 0 16px 0;">
+                    <input type="text" id="themeSearchInput" placeholder="{get_t(cfg, 'modal_search_placeholder')}" style="flex:1;">
+                    <button type="button" class="btn-sm" onclick="fetchCandidates()">{get_t(cfg, "modal_search_btn")}</button>
+                </div>
+
+                <div id="themeModalLoading" style="padding:25px; text-align:center; color:var(--text-muted);">
+                    Suche Soundtrack-Kandidaten auf YouTube & SoundCloud...
+                </div>
+
+                <div id="themeModalList" style="display:none;"></div>
+            </div>
+        </div>
+
         <script>
-            // Audio-Autostopp: Sobald ein Player startet, pausieren alle anderen
+            let currentModalItemId = null;
+
+            // Audio-Autostopp & 50% Standard-Lautstärke
             document.addEventListener('play', function(e){{
+                e.target.volume = 0.5; // Angenehme Standard-Lautstärke
                 var audios = document.getElementsByTagName('audio');
                 for(var i = 0, len = audios.length; i < len; i++){{
                     if(audios[i] != e.target){{
@@ -1893,6 +2450,119 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     }}
                 }}
             }}, true);
+
+            function closeModal(id) {{
+                // Pausiere alle Audios im Modal
+                const modal = document.getElementById(id);
+                if (modal) {{
+                    const audios = modal.getElementsByTagName('audio');
+                    for (let a of audios) a.pause();
+                    modal.style.display = 'none';
+                }}
+            }}
+
+            async function openThemeModal(itemId) {{
+                currentModalItemId = itemId;
+                const modal = document.getElementById('themeModal');
+                const row = document.getElementById('row_' + itemId);
+                const titleStr = row ? row.querySelector('strong').innerText : 'Titel';
+
+                document.getElementById('themeModalTitle').innerText = '{get_t(cfg, "btn_select")}: ' + titleStr;
+                document.getElementById('themeSearchInput').value = '';
+                modal.style.display = 'flex';
+
+                await fetchCandidates();
+            }}
+
+            async function fetchCandidates() {{
+                const loading = document.getElementById('themeModalLoading');
+                const list = document.getElementById('themeModalList');
+                const q = document.getElementById('themeSearchInput').value;
+
+                loading.style.display = 'block';
+                list.style.display = 'none';
+                list.innerHTML = '';
+
+                try {{
+                    const url = '/api/theme-candidates/' + currentModalItemId + (q ? ('?q=' + encodeURIComponent(q)) : '');
+                    const resp = await fetch(url);
+                    const data = await resp.json();
+
+                    loading.style.display = 'none';
+                    list.style.display = 'block';
+
+                    const banner = document.getElementById('themeSpuerhundBanner');
+                    if (data.soundtrack_info && data.soundtrack_info.display) {{
+                        banner.style.display = 'block';
+                        banner.innerHTML = '🎯 <strong>Erkannter Soundtrack:</strong> ' + data.soundtrack_info.display + ' <span style="color:#8b929a;">(Quelle: ' + data.soundtrack_info.source + ')</span>';
+                        if (!q && !document.getElementById('themeSearchInput').value) {{
+                            document.getElementById('themeSearchInput').value = data.soundtrack_info.display;
+                        }}
+                    }}
+
+                    if (!data.ok || !data.candidates || data.candidates.length === 0) {{
+                        list.innerHTML = '<div style=\"text-align:center; padding:20px; color:var(--text-muted);\">No matching soundtracks found. Try a different search query above!</div>';
+                        return;
+                    }}
+
+                    list.innerHTML = data.candidates.map(c => `
+                        <div class="candidate-row">
+                            <div style="flex:1; min-width:200px;">
+                                <div style="font-weight:600; font-size:0.9rem; color:#e4e6eb;">${{c.title}}</div>
+                                <div style="font-size:0.75rem; color:#8b929a; margin-top:2px;">
+                                    ${{c.uploader ? (c.uploader + ' • ') : ''}}{get_t(cfg, "modal_length")}${{c.duration_str}}
+                                    • <a href="${{c.url}}" target="_blank" rel="noopener" style="color:#7db2ff; text-decoration:none;">{get_t(cfg, "modal_open_yt")}</a>
+                                </div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <audio controls preload="none" src="/api/candidate-stream?v=${{encodeURIComponent(c.id)}}" style="width:160px; height:30px;"></audio>
+                                <button type="button" class="btn-sm success" onclick="applyCandidateTheme('${{currentModalItemId}}', '${{c.url}}')">{get_t(cfg, "modal_apply")}</button>
+                            </div>
+                        </div>
+                    `).join('');
+
+                }} catch (e) {{
+                    loading.style.display = 'none';
+                    list.style.display = 'block';
+                    list.innerHTML = '<div style=\"color:#ff8585; padding:15px;\">Search error: ' + e + '</div>';
+                }}
+            }}
+
+            async function applyCandidateTheme(itemId, customUrl) {{
+                const modal = document.getElementById('themeModal');
+                closeModal('themeModal');
+
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.action = '/replace/' + itemId;
+                
+                const inpTab = document.createElement('input');
+                inpTab.type = 'hidden';
+                inpTab.name = 'tab';
+                inpTab.value = '{clean_tab}';
+                form.appendChild(inpTab);
+
+                const inpFilter = document.createElement('input');
+                inpFilter.type = 'hidden';
+                inpFilter.name = 'filter_status';
+                inpFilter.value = '{filter_status}';
+                form.appendChild(inpFilter);
+
+                const inpQ = document.createElement('input');
+                inpQ.type = 'hidden';
+                inpQ.name = 'q';
+                inpQ.value = '{q}';
+                form.appendChild(inpQ);
+
+                const inpUrl = document.createElement('input');
+                inpUrl.type = 'hidden';
+                inpUrl.name = 'custom_input';
+                inpUrl.value = customUrl;
+                form.appendChild(inpUrl);
+
+                document.body.appendChild(form);
+                form.submit();
+            }}
 
             async function cancelRunningAction() {{
                 try {{
@@ -1941,7 +2611,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                             if (data.queue && data.queue.length > 0) {{
                                 document.getElementById('queueList').innerText = data.queue.slice(0, 6).join(' • ') + (data.queue.length > 6 ? ' ... (+' + (data.queue.length - 6) + ' weitere)' : '');
                             }} else {{
-                                document.getElementById('queueList').innerText = 'Keine weiteren Titel in der Warteschlange.';
+                                document.getElementById('queueList').innerText = '{get_t(cfg, "no_more_queue")}';
                             }}
 
                             if (data.recent_finished && data.recent_finished.length > 0) {{
