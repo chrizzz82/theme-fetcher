@@ -1,0 +1,53 @@
+name: theme-fetcher
+services:
+  theme-fetcher:
+    build: .
+    image: theme-fetcher:alpha
+    container_name: theme-fetcher
+    ports:
+      - "8080:8080"
+    volumes:
+      # Zentraler Medienordner (auf ZimaOS z.B. /DATA/Media):
+      - /DATA/Media:/media
+      # Persistenter Speicher für Status, Blacklist & Sammlungen:
+      - /DATA/AppData/theme-fetcher/data:/data
+      # Optional für Jellyfin BoxSet Metadata Sync:
+      # - /DATA/AppData/jellyfin/config/metadata:/jellyfin-metadata
+    environment:
+      - TZ=Europe/Berlin
+
+      # --- 1. Jellyfin (Optional) ---
+      - JELLYFIN_URL=http://DEINE_SERVER_IP:8096
+      - JELLYFIN_API_KEY=DEIN_JELLYFIN_API_KEY
+
+      # --- 2. Plex (Optional) ---
+      - PLEX_URL=http://DEINE_SERVER_IP:32400
+      - PLEX_TOKEN=DEIN_PLEX_TOKEN
+
+      # --- 3. Emby (Optional) ---
+      - EMBY_URL=http://DEINE_SERVER_IP:8096
+      - EMBY_API_KEY=DEIN_EMBY_API_KEY
+
+      # --- 4. Lokaler Scan (Kodi / Infuse / Universell) ---
+      # Setze auf true, um /media direkt nach Ordnern ("Titel (Jahr)") zu scannen:
+      - LOCAL_SCAN_ENABLED=false
+      - LOCAL_MEDIA_DIR=/media
+
+      # --- Parameter ---
+      - MAX_DURATION_SEC=270
+      - SCAN_INTERVAL_HOURS=12
+    restart: unless-stopped
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: theme-fetcher
+  port_map: "8080"
+  category: Media
+  title:
+    en_US: Theme Fetcher (Alpha)
+    de_DE: Theme Fetcher (Alpha)
+  tagline:
+    en_US: Audio themes for Plex, Jellyfin, Emby & local media
+    de_DE: Audio-Themes für Plex, Jellyfin, Emby & lokale Medien
