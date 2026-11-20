@@ -7,21 +7,22 @@ import threading
 import subprocess
 import requests
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from fastapi import FastAPI, Form, HTTPException, Response
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
-import xml.etree.ElementTree as ET
 
 app = FastAPI(title="Theme Fetcher")
 
 DATA_DIR = Path("/data")
 COLLECTIONS_DIR = DATA_DIR / "collections"
+LOCAL_THEMES_DIR = DATA_DIR / "local_themes"
 CONFIG_FILE = DATA_DIR / "config.json"
 STATE_FILE = DATA_DIR / "state.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 COLLECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_THEMES_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
     "local_media_paths": os.getenv("LOCAL_MEDIA_DIR", "/media"),
@@ -33,7 +34,7 @@ DEFAULT_CONFIG = {
     "plex_token": os.getenv("PLEX_TOKEN", ""),
     "max_duration_sec": int(os.getenv("MAX_DURATION_SEC", "270")),
     "scan_interval_hours": int(os.getenv("SCAN_INTERVAL_HOURS", "12")),
-    "auto_download": False  # Neu: Standardmäßig manueller Download nach Scan
+    "auto_download": False
 }
 
 EXCLUDE_KEYWORDS = [
@@ -48,7 +49,7 @@ stop_requested = False
 
 scan_progress = {
     "is_running": False,
-    "action_type": "",  # "scan" oder "download"
+    "action_type": "",
     "current_step": "Bereit",
     "current_item": "",
     "processed": 0,
@@ -95,6 +96,29 @@ def slugify(text: str) -> str:
     return re.sub(r"[-\s]+", "_", clean) or "collection"
 
 
+def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Path]:
+    """Prüft zuverlässig, ob theme.mp3 im Medienordner oder im Fallback-Cache liegt"""
+    existing = existing or {}
+    candidates = []
+
+    if it.get("dir"):
+        candidates.append(Path(it["dir"]) / "theme.mp3")
+
+    if existing.get("dir") and existing.get("dir") != it.get("dir"):
+        candidates.append(Path(existing["dir"]) / "theme.mp3")
+
+    item_id = it.get("id") or existing.get("id")
+    if item_id:
+        candidates.append(LOCAL_THEMES_DIR / item_id / "theme.mp3")
+
+    for c in candidates:
+        if c.exists() and c.is_file() and c.stat().st_size > 0:
+            return True, str(c.parent), c
+
+    default_dir = it.get("dir") or (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")
+    return False, default_dir, Path(default_dir) / "theme.mp3"
+
+
 def find_jellyfin_boxset_dir(title: str, jf_meta_base: str) -> Optional[Path]:
     base = Path(jf_meta_base)
     if not base.exists():
@@ -128,24 +152,49 @@ def resolve_media_path(raw_path_str: str) -> Path:
         return p
 
     parts = [part for part in p.parts if part not in ("/", "\\", "")]
+    if not parts:
+        return Path("/media")
 
-    cand1 = Path("/media", *parts)
+    media_base = Path("/media")
+    if not media_base.exists():
+        return p
+
+    # 1. Direkter Pfad unter /media (z.B. /media/Film/... oder /media/Serien/...)
+    cand1 = media_base.joinpath(*parts)
     if cand1.exists() or cand1.parent.exists():
         return cand1
 
+    # 2. Case-Insensitive / Teilweiser Abgleich des Bibliotheksordners (Film vs Filme, Serien vs Series)
+    top_name = parts[0].lower()
+    try:
+        for entry in media_base.iterdir():
+            if entry.is_dir():
+                ename = entry.name.lower()
+                if ename == top_name or top_name in ename or ename in top_name:
+                    cand = entry.joinpath(*parts[1:])
+                    if cand.exists() or cand.parent.exists():
+                        return cand
+    except Exception:
+        pass
+
+    # 3. Wenn übergeordnete Sektion weggelassen wurde: /media/...
     if len(parts) > 1:
-        cand2 = Path("/media", *parts[1:])
+        cand2 = media_base.joinpath(*parts[1:])
         if cand2.exists() or cand2.parent.exists():
             return cand2
 
-    for i, part in enumerate(parts):
-        if part.lower() in ("media", "data", "movies", "filme", "film", "serien", "series", "shows"):
-            candidate = Path("/media", *parts[i:])
-            if candidate.exists() or candidate.parent.exists():
-                return candidate
-            candidate_inner = Path("/media", *parts[i+1:])
-            if candidate_inner.exists() or candidate_inner.parent.exists():
-                return candidate_inner
+    # 4. Suche nach dem Ziel-Ordnernamen (z.B. Serienname) in /media
+    target_name = parts[-1].lower()
+    try:
+        for root, dirs, _ in os.walk(media_base):
+            for d in dirs:
+                if d.lower() == target_name:
+                    return Path(root) / d
+            # Tiefe begrenzen
+            if len(Path(root).relative_to(media_base).parts) >= 2:
+                dirs.clear()
+    except Exception:
+        pass
 
     return cand1
 
@@ -319,7 +368,6 @@ def test_folder_path(paths_str: str) -> dict:
 
 
 def fetch_jellyfin_items(url: str, api_key: str) -> tuple[List[dict], List[str]]:
-    """Liest lückenlos ALLE Bibliotheken aus Jellyfin ein"""
     if not url or not api_key:
         return [], []
     headers = get_jellyfin_headers(api_key)
@@ -327,7 +375,6 @@ def fetch_jellyfin_items(url: str, api_key: str) -> tuple[List[dict], List[str]]
     scanned_folders = []
     seen_ids = set()
 
-    # 1. Alle virtuellen Bibliotheksordner abfragen
     try:
         vf_resp = requests.get(f"{url}/Library/VirtualFolders", headers=headers, params={"api_key": api_key.strip()}, timeout=10)
         if vf_resp.status_code == 200:
@@ -339,7 +386,6 @@ def fetch_jellyfin_items(url: str, api_key: str) -> tuple[List[dict], List[str]]
     except Exception as e:
         print(f"[Jellyfin VirtualFolders Warnung] {e}")
 
-    # 2. Rekursiv alle Medien ohne Benutzerbeschränkung abrufen
     try:
         params = {
             "IncludeItemTypes": "Movie,Series,BoxSet",
@@ -547,7 +593,7 @@ def find_candidate(search_expr: str, blacklist: List[str], max_dur: int) -> tupl
                 continue
 
             return {"id": vid_id or url, "url": url, "title": vid_title}, "OK"
-        return None, "Kein passender Treffer unterhalb max. Dauer"
+        return None, "Kein Treffer unter max. Dauer"
     except subprocess.TimeoutExpired:
         return None, "Such-Timeout"
     except Exception as e:
@@ -564,7 +610,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
         test_write.write_text("ok")
         test_write.unlink()
     except Exception:
-        safe_fallback = DATA_DIR / "local_themes" / item["id"]
+        safe_fallback = LOCAL_THEMES_DIR / item["id"]
         safe_fallback.mkdir(parents=True, exist_ok=True)
         target_dir = safe_fallback
         item["dir"] = str(safe_fallback)
@@ -636,7 +682,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
 
 def run_scan_only():
-    """Schritt 1: Scannt nur alle Bibliotheken und prüft vorhandene Themes OHNE Download"""
+    """Schritt 1: Scannt Bibliotheken und prüft theme.mp3 ohne automatischen Download"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -700,17 +746,25 @@ def run_scan_only():
             scan_progress["current_item"] = f"Prüfe: {it['title']}"
 
             existing = state["items"].get(item_id, {})
-            mp3_path = Path(it["dir"]) / "theme.mp3"
-            theme_exists = mp3_path.exists()
+            theme_exists, actual_dir, mp3_file = check_item_theme(it, existing)
+
+            it["dir"] = actual_dir
 
             if theme_exists and it.get("type") == "Collection":
-                sync_collection_theme(it, mp3_path, jf_meta)
+                sync_collection_theme(it, mp3_file, jf_meta)
+
+            # Saubere Status-Trennung: Niemals "Vorhanden" wenn Datei fehlt!
+            if theme_exists:
+                status_txt = existing.get("video_title") or "Vorhanden"
+            else:
+                prev_status = existing.get("status", "")
+                status_txt = prev_status if prev_status and prev_status != "Vorhanden" else "Fehlt"
 
             record = {
                 **existing,
                 **it,
                 "has_theme": theme_exists,
-                "status": "Vorhanden" if theme_exists else existing.get("status", "Fehlt")
+                "status": status_txt
             }
             state["items"][item_id] = record
 
@@ -724,7 +778,7 @@ def run_scan_only():
 
 
 def run_download_all():
-    """Schritt 2: Lädt fehlende Themes nur nach manuellem Start herunter"""
+    """Schritt 2: Lädt fehlende Themes nach manuellem Start herunter"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -771,7 +825,7 @@ def run_download_all():
                 it["has_theme"] = True
                 it["video_id"] = dl_res["video_id"]
                 it["video_title"] = dl_res["video_title"]
-                it["status"] = "Heruntergeladen"
+                it["status"] = dl_res["video_title"] or "Heruntergeladen"
                 scan_progress["new_downloaded"] += 1
             else:
                 it["status"] = dl_res["msg"]
@@ -788,7 +842,6 @@ def run_download_all():
         scan_progress["is_running"] = False
 
 
-# COVER-BILD PROXY
 @app.get("/poster/{item_id}")
 def get_poster(item_id: str):
     state = load_state()
@@ -797,23 +850,31 @@ def get_poster(item_id: str):
     if not item:
         raise HTTPException(status_code=404)
 
-    # 1. Jellyfin Cover
+    # 1. Jellyfin Cover (Primary, Backdrop, Thumb) mit API-Key in Query
     if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
         jf_url = cfg["jellyfin_url"]
         raw_id = item["jf_raw_id"]
-        headers = get_jellyfin_headers(cfg.get("jellyfin_api_key", ""))
-        img_url = f"{jf_url}/Items/{raw_id}/Images/Primary?maxWidth=140&quality=85"
-        try:
-            r = requests.get(img_url, headers=headers, timeout=5)
-            if r.status_code == 200:
-                return Response(content=r.content, media_type=r.headers.get("Content-Type", "image/jpeg"))
-        except Exception:
-            pass
+        api_key = cfg.get("jellyfin_api_key", "").strip()
+        headers = get_jellyfin_headers(api_key)
 
-    # 2. Lokales Cover (folder.jpg, poster.jpg etc.)
+        for img_type in ("Primary", "Thumb", "Backdrop"):
+            img_url = f"{jf_url}/Items/{raw_id}/Images/{img_type}"
+            try:
+                r = requests.get(
+                    img_url,
+                    headers=headers,
+                    params={"maxWidth": "160", "quality": "85", "api_key": api_key},
+                    timeout=4
+                )
+                if r.status_code == 200 and len(r.content) > 100:
+                    return Response(content=r.content, media_type=r.headers.get("Content-Type", "image/jpeg"))
+            except Exception:
+                pass
+
+    # 2. Lokales Cover (poster.jpg, folder.jpg, cover.jpg, show.jpg)
     p = Path(item.get("dir", ""))
     if p.exists() and p.is_dir():
-        for fname in ("poster.jpg", "folder.jpg", "cover.jpg", "poster.png", "folder.png"):
+        for fname in ("poster.jpg", "folder.jpg", "cover.jpg", "show.jpg", "poster.png", "folder.png"):
             img_file = p / fname
             if img_file.exists():
                 return FileResponse(img_file)
@@ -833,10 +894,12 @@ def stream_audio(item_id: str):
     item = state["items"].get(item_id)
     if not item:
         raise HTTPException(status_code=404)
-    mp3 = Path(item["dir"]) / "theme.mp3"
-    if not mp3.exists():
+
+    has_theme, real_dir, mp3_file = check_item_theme(item)
+    if not has_theme or not mp3_file.exists():
         raise HTTPException(status_code=404)
-    return FileResponse(mp3, media_type="audio/mpeg")
+
+    return FileResponse(mp3_file, media_type="audio/mpeg", headers={"Accept-Ranges": "bytes"})
 
 
 @app.get("/api/progress")
@@ -940,7 +1003,7 @@ def replace_theme(item_id: str, custom_input: str = Form("")):
         item["has_theme"] = True
         item["video_id"] = dl_res["video_id"]
         item["video_title"] = dl_res["video_title"]
-        item["status"] = "Heruntergeladen"
+        item["status"] = dl_res["video_title"] or "Heruntergeladen"
     else:
         item["status"] = dl_res["msg"]
 
@@ -954,8 +1017,10 @@ def delete_theme(item_id: str):
     state = load_state()
     item = state["items"].get(item_id)
     if item:
-        mp3 = Path(item["dir"]) / "theme.mp3"
-        mp3.unlink(missing_ok=True)
+        # Lösche sowohl im Medienordner als auch im Fallback-Cache
+        for p in (Path(item.get("dir", "")) / "theme.mp3", LOCAL_THEMES_DIR / item["id"] / "theme.mp3"):
+            p.unlink(missing_ok=True)
+
         old_vid = item.get("video_id")
         if old_vid:
             state["blacklist"].setdefault(item_id, []).append(old_vid)
@@ -973,7 +1038,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
 
     total_filme = sum(1 for i in all_items if i.get("type") == "Film")
     filme_ok = sum(1 for i in all_items if i.get("type") == "Film" and i.get("has_theme"))
-    
+
     total_serien = sum(1 for i in all_items if i.get("type") == "Serie")
     serien_ok = sum(1 for i in all_items if i.get("type") == "Serie" and i.get("has_theme"))
 
@@ -1005,24 +1070,34 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     rows = ""
     for it in items:
         iid = it["id"]
+        has_theme = bool(it.get("has_theme"))
         orig_hint = (
             f" <small style='color:#7d8590;'>[{it['original_title']}]</small>"
             if it.get("original_title") and it["original_title"].lower() != it["title"].lower()
             else ""
         )
+
         badge = (
             '<span class="badge ok">Vorhanden</span>'
-            if it.get("has_theme")
+            if has_theme
             else '<span class="badge miss">Fehlt</span>'
         )
         player = (
             f'<audio controls preload="none" src="/audio/{iid}?t={int(time.time())}"></audio>'
-            if it.get("has_theme")
+            if has_theme
             else "-"
         )
-        
-        status_color = "#5ce69a" if it.get("has_theme") else "#ff7b7b"
-        status_display = it.get("video_title") or it.get("status")
+
+        # Status & Zusatzinformationen
+        if has_theme:
+            v_title = it.get("video_title") or ""
+            sub_info = f"<div style='font-size:0.78rem; color:#5ce69a; margin-top:3px;'>🎵 {v_title}</div>" if v_title else ""
+        else:
+            err_msg = it.get("status") or ""
+            if err_msg and err_msg != "Fehlt" and err_msg != "Vorhanden":
+                sub_info = f"<div style='font-size:0.78rem; color:#ff8585; margin-top:3px;'>⚠️ {err_msg}</div>"
+            else:
+                sub_info = ""
 
         rows += f"""
         <tr>
@@ -1031,10 +1106,12 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </td>
             <td>
                 <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
-                <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span><br>
-                <span style="font-size:0.8rem; color:{status_color};">Status: {status_display}</span>
+                <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
             </td>
-            <td>{badge}</td>
+            <td>
+                {badge}
+                {sub_info}
+            </td>
             <td>{player}</td>
             <td>
                 <form method="post" action="/replace/{iid}" class="inline-form">
@@ -1135,7 +1212,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="secondary" onclick="toggleSettings()">⚙️ Einstellungen</button>
                 <form method="post" action="/scan" style="display:inline;">
-                    <button type="submit" title="Sucht nur nach neuen Filmen/Serien und prüft, ob themes fehlen (ohne Download)">🔍 Mediathek scannen</button>
+                    <button type="submit" title="Prüft Bibliotheken und gleicht vorhandene themes ab (ohne Download)">🔍 Mediathek scannen</button>
                 </form>
                 <form method="post" action="/download-all" style="display:inline;">
                     <button type="submit" class="success" title="Startet den Download für alle fehlenden Themes">⬇️ Fehlende laden ({missing_count})</button>
@@ -1271,7 +1348,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                 <thead>
                     <tr>
                         <th style="width:50px;">Cover</th>
-                        <th>Titel & Pfad & Status</th>
+                        <th>Titel & Pfad</th>
                         <th>Status</th>
                         <th>Vorschau</th>
                         <th>Aktion (Download / Link)</th>
