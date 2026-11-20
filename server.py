@@ -12,7 +12,7 @@ from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Theme Fetcher & Media Manager (tMM)")
+app = FastAPI(title="Theme Fetcher")
 
 DATA_DIR = Path("/data")
 COLLECTIONS_DIR = DATA_DIR / "collections"
@@ -62,7 +62,7 @@ scan_progress = {
     "current_step": "Bereit",
     "current_item_id": "",
     "current_item_title": "",
-    "item_status": {},
+    "item_status": {},  # item_id -> {"status": str, "percent": int, "step": str}
     "processed": 0,
     "total": 0,
     "percent": 0,
@@ -147,7 +147,7 @@ def find_theme_file_in_dir(d: Path) -> Optional[Path]:
 
 
 def resolve_media_path(raw_path_str: str) -> Path:
-    """Intelligentes Multi-Platten-Mapping: Löst Pfade über alle ZimaOS-Platten auf"""
+    """Intelligentes Multi-Platten-Mapping: Löst Pfade über alle ZimaOS-Platten auf (/media/Serien, /media/HDD-Storage)"""
     raw_str = raw_path_str.replace("\\", "/")
     p = Path(raw_str)
     if p.exists():
@@ -157,22 +157,20 @@ def resolve_media_path(raw_path_str: str) -> Path:
     if not parts:
         return Path("/media")
 
-    # 1. Wenn /media davor gehängt wird (z. B. /Serien/Die Dinos -> /media/Serien/Die Dinos)
-    cand_media = Path("/media").joinpath(*parts)
+    media_base = Path("/media")
+    # 1. Direktes Voranstellen von /media (z. B. /Serien/Die Dinos -> /media/Serien/Die Dinos)
+    cand_media = media_base.joinpath(*parts)
     if cand_media.exists() or cand_media.parent.exists():
         return cand_media
 
-    # 2. Prüfe alle Unterverzeichnisse von /media (jede eingehängte Festplatte)
-    media_base = Path("/media")
+    # 2. Prüfe alle Festplatten-Mounts unter /media
     if media_base.exists():
         try:
-            # Direkte Suche auf allen eingehängten Festplatten
             for disk in media_base.iterdir():
                 if disk.is_dir():
                     disk_cand = disk.joinpath(*parts)
                     if disk_cand.exists() or disk_cand.parent.exists():
                         return disk_cand
-                    # Falls erster Teil dem Festplattennamen ähnelt
                     if len(parts) > 1:
                         disk_cand2 = disk.joinpath(*parts[1:])
                         if disk_cand2.exists() or disk_cand2.parent.exists():
@@ -180,7 +178,7 @@ def resolve_media_path(raw_path_str: str) -> Path:
         except Exception:
             pass
 
-    # 3. Tiefensuche nach dem Zielordner
+    # 3. Tiefensuche nach Ordnername
     target_name = parts[-1].lower()
     target_slug = slugify(parts[-1])
     if media_base.exists():
@@ -197,8 +195,42 @@ def resolve_media_path(raw_path_str: str) -> Path:
     return cand_media
 
 
-def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
-    """Tiefensuche: Findet theme.mp3 auch bei separaten Festplatten und korrigiert it['dir'] dauerhaft"""
+def get_jellyfin_headers(api_key: str) -> dict:
+    clean_key = api_key.strip()
+    return {
+        "X-Emby-Token": clean_key,
+        "X-MediaBrowser-Token": clean_key,
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.4.0"',
+        "Accept": "application/json"
+    }
+
+
+def check_jellyfin_has_theme(jf_url: str, api_key: str, jf_raw_id: str) -> Tuple[bool, str]:
+    """Fragt Jellyfin direkt über die API, ob bereits ein ThemeSong hinterlegt ist"""
+    if not jf_url or not api_key or not jf_raw_id:
+        return False, ""
+    headers = get_jellyfin_headers(api_key)
+    try:
+        r = requests.get(f"{jf_url}/Items/{jf_raw_id}/ThemeSongs", headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                t_name = data[0].get("Name") or "Jellyfin Theme"
+                return True, t_name
+            elif isinstance(data, dict):
+                items = data.get("Items", [])
+                if items:
+                    t_name = items[0].get("Name") or "Jellyfin Theme"
+                    return True, t_name
+                if data.get("TotalRecordCount", 0) > 0:
+                    return True, "Jellyfin Theme"
+    except Exception:
+        pass
+    return False, ""
+
+
+def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
+    """Tiefensuche: Prüft Festplatten & Jellyfin-API auf vorhandene theme.mp3"""
     existing = existing or {}
     candidates = []
 
@@ -260,6 +292,14 @@ def check_item_theme(it: dict, existing: Optional[dict] = None) -> Tuple[bool, s
                     dirs.clear()
         except Exception:
             pass
+
+    # Doppelter Boden: Prüfe direkt über Jellyfin API
+    if cfg and it.get("source") == "Jellyfin" and it.get("jf_raw_id") and cfg.get("jellyfin_url"):
+        has_jf_theme, t_name = check_jellyfin_has_theme(cfg["jellyfin_url"], cfg.get("jellyfin_api_key", ""), it["jf_raw_id"])
+        if has_jf_theme:
+            default_dir = str(it.get("dir") or (candidates[0] if candidates else "/media"))
+            it["video_title"] = t_name
+            return True, default_dir, None
 
     default_dir = str(it.get("dir") or (candidates[0] if candidates else (str(LOCAL_THEMES_DIR / item_id) if item_id else "/media")))
     return False, default_dir, None
@@ -346,7 +386,6 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
                     if filter_type and itype != filter_type:
                         continue
 
-                    # TITEL- & JAHRES-BASIERTE DEDUPLIZIERUNG GEGEN JELLYFIN/PLEX
                     item_slug = f"{slugify(title)}_{year or ''}"
                     alt_slug = slugify(title)
                     if item_slug in exclude_slugs or alt_slug in exclude_slugs or str(rpath) in exclude_slugs:
@@ -367,16 +406,6 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
             print(f"[Lokaler Scan Fehler bei {base_str}] {e}")
 
     return results, scanned_dirs
-
-
-def get_jellyfin_headers(api_key: str) -> dict:
-    clean_key = api_key.strip()
-    return {
-        "X-Emby-Token": clean_key,
-        "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="ZimaOS", DeviceId="theme-fetcher-zimaos", Version="1.3.0"',
-        "Accept": "application/json"
-    }
 
 
 def test_jellyfin_connection(url: str, api_key: str) -> dict:
@@ -714,7 +743,7 @@ def find_all_candidates(search_expr: str, blacklist: List[str], min_dur: int, ma
     return candidates
 
 
-def post_process_audio(input_file: Path, output_file: Path, duration: int, fade: bool = True, cover_path: Optional[Path] = None):
+def post_process_audio(input_file: Path, output_file: Path, duration: int, fade: bool = True):
     temp_processed = input_file.parent / f"processed_{input_file.name}"
     
     af_filter = []
@@ -725,14 +754,7 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
             af_filter.append(f"afade=t=out:st={out_start}:d=3.0")
 
     af_arg = ",".join(af_filter) if af_filter else "anull"
-    cmd = ["ffmpeg", "-y", "-i", str(input_file)]
-    
-    if cover_path and cover_path.exists():
-        cmd.extend(["-i", str(cover_path), "-map", "0:a", "-map", "1:v", "-c:a", "libmp3lame", "-b:a", "192k", "-c:v", "copy", "-id3v2_version", "3", "-metadata:s:v", 'title="Album cover"', "-metadata:s:v", 'comment="Cover (front)"'])
-    else:
-        cmd.extend(["-c:a", "libmp3lame", "-b:a", "192k"])
-
-    cmd.extend(["-af", af_arg, str(temp_processed)])
+    cmd = ["ffmpeg", "-y", "-i", str(input_file), "-c:a", "libmp3lame", "-b:a", "192k", "-af", af_arg, str(temp_processed)]
 
     try:
         subprocess.run(cmd, capture_output=True, timeout=30)
@@ -750,31 +772,6 @@ def post_process_audio(input_file: Path, output_file: Path, duration: int, fade:
             output_file.unlink()
         input_file.rename(output_file)
     return True
-
-
-def save_poster_to_disk(item: dict) -> bool:
-    target_dir = Path(item.get("dir", ""))
-    if not target_dir.exists() or not target_dir.is_dir():
-        return False
-
-    poster_file = target_dir / "poster.jpg"
-    if poster_file.exists():
-        return True
-
-    cfg = load_config()
-    if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
-        jf_url = cfg["jellyfin_url"]
-        raw_id = item["jf_raw_id"]
-        api_key = cfg.get("jellyfin_api_key", "").strip()
-        headers = get_jellyfin_headers(api_key)
-        try:
-            r = requests.get(f"{jf_url}/Items/{raw_id}/Images/Primary", headers=headers, timeout=8)
-            if r.status_code == 200 and len(r.content) > 1024:
-                poster_file.write_bytes(r.content)
-                return True
-        except Exception:
-            pass
-    return False
 
 
 def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, blacklist: List[str] = None, min_dur: int = 25, max_dur: int = 270, jf_meta_base: str = "/jellyfin-metadata", fade: bool = True) -> dict:
@@ -854,10 +851,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
             if downloaded.exists() and downloaded.stat().st_size > 1024:
                 scan_progress["item_status"][item_id] = {"status": "processing", "percent": 85, "step": "Schneide Audio (Fade-In/Out)..."}
 
-                save_poster_to_disk(item)
-                cover_file = target_dir / "poster.jpg" if (target_dir / "poster.jpg").exists() else None
-
-                post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade, cover_path=cover_file)
+                post_process_audio(downloaded, output_mp3, chosen_video.get("duration", 180), fade=fade)
                 sync_collection_theme(item, output_mp3, jf_meta_base)
 
                 scan_progress["item_status"][item_id] = {"status": "done", "percent": 100, "step": "Erfolgreich geladen!"}
@@ -875,6 +869,7 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, b
 
 
 def run_scan(scope: str = "all"):
+    """Führt entweder einen strikten Einzelkategorie-Scan oder einen globalen Komplett-Scan aus"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -923,7 +918,7 @@ def run_scan(scope: str = "all"):
                     jf_slugs.add(it["dir"])
 
         if cfg.get("local_scan_enabled", True):
-            scan_progress["current_step"] = "Prüfe lokale Medienordner..."
+            scan_progress["current_step"] = f"Prüfe lokale Ordner ({scope_name})..."
             loc_items, loc_folders = scan_local_folders(
                 cfg.get("local_media_paths", "/media"),
                 filter_type=filter_type,
@@ -937,13 +932,20 @@ def run_scan(scope: str = "all"):
         for it in raw_items:
             current_state_items[it["id"]] = it
 
-        # 2. HARTE DEDUPLIZIERUNG IN STATE (tMM Standard: 1 Film/Serie = genau 1 Zeile!)
+        # 2. DEDUPLIZIERUNG: 1 Film / Serie = 1 Zeile
         unified_items = {}
-        # Priorität: Jellyfin > Plex > Lokal
         source_prio = {"Jellyfin": 3, "Plex": 2, "Lokal": 1}
 
-        # Vereinige alle vorhandenen Items + neue Items
-        combined = list(state.get("items", {}).values()) + list(current_state_items.values())
+        # Falls Scope-spezifisch: Behalte bestehende Items anderer Kategorien unangetastet!
+        existing_other = {}
+        existing_same = {}
+        for k, v in state.get("items", {}).items():
+            if scope != "all" and v.get("type") != scope:
+                existing_other[k] = v
+            else:
+                existing_same[k] = v
+
+        combined = list(existing_same.values()) + list(current_state_items.values())
         for it in combined:
             it_type = it.get("type", "Film")
             it_title_slug = slugify(it.get("title", ""))
@@ -956,23 +958,21 @@ def run_scan(scope: str = "all"):
                 existing = unified_items[unique_key]
                 prio_new = source_prio.get(it.get("source"), 0)
                 prio_old = source_prio.get(existing.get("source"), 0)
-                # Falls neues Item höhere Prio hat oder echtere Pfade liefert: überschreiben
                 if prio_new > prio_old:
                     unified_items[unique_key] = {**existing, **it}
                 else:
                     unified_items[unique_key] = {**it, **existing}
 
-        # Jetzt neues state["items"] rein mit eindeutigen IDs aufbauen
-        new_items_dict = {it["id"]: it for it in unified_items.values()}
-        state["items"] = new_items_dict
+        # Strikte Filterung: Verarbeite NUR Items der gewählten Rubrik!
+        items_to_process = list(unified_items.values())
+        if scope != "all":
+            items_to_process = [it for it in items_to_process if it.get("type") == scope]
 
-        total_items = len(new_items_dict)
+        total_items = len(items_to_process)
         scan_progress["total"] = total_items
         jf_meta = cfg.get("jf_metadata_dir", "/jellyfin-metadata")
 
-        items_list = list(new_items_dict.values())
-
-        for idx, it in enumerate(items_list, 1):
+        for idx, it in enumerate(items_to_process, 1):
             if stop_requested:
                 scan_progress["current_step"] = "Scan abgebrochen!"
                 break
@@ -983,8 +983,8 @@ def run_scan(scope: str = "all"):
             scan_progress["current_item_title"] = f"{it['title']}"
             scan_progress["current_item_id"] = item_id
 
-            existing = state["items"].get(item_id, {})
-            theme_exists, actual_dir, mp3_file = check_item_theme(it, existing)
+            existing = existing_same.get(item_id, {})
+            theme_exists, actual_dir, mp3_file = check_item_theme(it, existing, cfg)
 
             it["dir"] = actual_dir
 
@@ -992,7 +992,7 @@ def run_scan(scope: str = "all"):
                 sync_collection_theme(it, mp3_file, jf_meta)
 
             if theme_exists:
-                status_txt = existing.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
+                status_txt = it.get("video_title") or existing.get("video_title") or (mp3_file.name if mp3_file else "Vorhanden")
                 scan_progress["item_status"][item_id] = {"status": "ok", "percent": 100, "step": "Vorhanden"}
             else:
                 prev_status = existing.get("status", "")
@@ -1005,7 +1005,10 @@ def run_scan(scope: str = "all"):
                 "has_theme": theme_exists,
                 "status": status_txt
             }
-            state["items"][item_id] = record
+            existing_same[item_id] = record
+
+        # Speichere die bearbeitete Kategorie zusammen mit den unangetasteten anderen Kategorien ab
+        state["items"] = {**existing_other, **existing_same}
 
         if scope == "all":
             state["folders"] = all_scanned_folders
@@ -1020,6 +1023,7 @@ def run_scan(scope: str = "all"):
 
 
 def run_download_queue(scope: str = "all"):
+    """Lädt fehlende Themes in die Warteschlange – unterstützt Fortschrittsbalken pro Zeile & global"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -1217,7 +1221,7 @@ def scan_single(
     if not item:
         raise HTTPException(status_code=404)
 
-    theme_exists, actual_dir, mp3_file = check_item_theme(item)
+    theme_exists, actual_dir, mp3_file = check_item_theme(item, cfg=cfg)
     item["dir"] = actual_dir
     item["has_theme"] = theme_exists
     if theme_exists:
@@ -1300,172 +1304,6 @@ def delete_theme(
 
     clean_tab = normalize_tab(tab)
     return RedirectResponse(f"/?tab={clean_tab}&filter_status={filter_status}&q={q}", status_code=303)
-
-
-# --- TMM MODAL APIs (RENAMER & POSTER) ---
-
-@app.get("/api/rename-preview/{item_id}")
-def api_rename_preview(item_id: str):
-    state = load_state()
-    item = state["items"].get(item_id)
-    if not item or not item.get("dir"):
-        return {"ok": False, "msg": "Eintrag oder Pfad nicht gefunden"}
-
-    item_dir = Path(item["dir"])
-    title = item.get("title", "").strip()
-    year = item.get("year")
-    clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
-    new_dir_name = f"{clean_title} ({year})" if year else clean_title
-
-    files = []
-    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts"}
-    if item_dir.exists() and item_dir.is_dir():
-        for f in item_dir.iterdir():
-            if f.is_file() and f.suffix.lower() in video_exts:
-                if item.get("type") == "Film":
-                    new_file_name = f"{new_dir_name}{f.suffix.lower()}"
-                    files.append({"old": f.name, "new": new_file_name, "changed": (f.name != new_file_name)})
-                else:
-                    files.append({"old": f.name, "new": f.name, "changed": False})
-
-    return {
-        "ok": True,
-        "item_id": item_id,
-        "title": title,
-        "current_dir": item_dir.name,
-        "new_dir": new_dir_name,
-        "dir_changed": (item_dir.name != new_dir_name),
-        "full_path": str(item_dir),
-        "files": files
-    }
-
-
-class RenameExecuteReq(BaseModel):
-    item_id: str
-
-@app.post("/api/rename-execute")
-def api_rename_execute(data: RenameExecuteReq):
-    state = load_state()
-    item = state["items"].get(data.item_id)
-    if not item or not item.get("dir"):
-        return {"ok": False, "msg": "Eintrag oder Pfad nicht gefunden"}
-
-    item_dir = Path(item["dir"])
-    if not item_dir.exists():
-        return {"ok": False, "msg": f"Verzeichnis {item_dir} existiert nicht"}
-
-    title = item.get("title", "").strip()
-    year = item.get("year")
-    clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
-    new_dir_name = f"{clean_title} ({year})" if year else clean_title
-
-    renamed = []
-    video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts"}
-    for f in list(item_dir.iterdir()):
-        if f.is_file() and f.suffix.lower() in video_exts:
-            if item.get("type") == "Film":
-                new_file_name = f"{new_dir_name}{f.suffix.lower()}"
-                new_file_path = item_dir / new_file_name
-                if f != new_file_path and not new_file_path.exists():
-                    try:
-                        f.rename(new_file_path)
-                        renamed.append(f"{f.name} ➔ {new_file_name}")
-                    except Exception as e:
-                        return {"ok": False, "msg": f"Dateifehler: {e}"}
-
-    if item_dir.name != new_dir_name and item_dir.parent.exists():
-        new_dir_path = item_dir.parent / new_dir_name
-        if not new_dir_path.exists():
-            try:
-                item_dir.rename(new_dir_path)
-                item["dir"] = str(new_dir_path)
-                state["items"][data.item_id] = item
-                save_state(state)
-                renamed.append(f"Ordner ➔ {new_dir_name}")
-            except Exception as e:
-                return {"ok": False, "msg": f"Ordnerfehler: {e}"}
-
-    return {"ok": True, "msg": "Erfolgreich umbenannt: " + (", ".join(renamed) or "Bereits sauber benannt!")}
-
-
-@app.get("/api/poster-preview/{item_id}")
-def api_poster_preview(item_id: str):
-    state = load_state()
-    item = state["items"].get(item_id)
-    if not item:
-        return {"ok": False, "msg": "Eintrag nicht gefunden"}
-
-    p = Path(item.get("dir", ""))
-    has_local = False
-    local_name = ""
-    if p.exists() and p.is_dir():
-        for fname in ("poster.jpg", "folder.jpg", "cover.jpg"):
-            if (p / fname).exists():
-                has_local = True
-                local_name = fname
-                break
-
-    return {
-        "ok": True,
-        "item_id": item_id,
-        "title": item["title"],
-        "poster_url": f"/poster/{item_id}?t={int(time.time())}",
-        "dir": item.get("dir"),
-        "has_local": has_local,
-        "local_name": local_name,
-        "has_theme": item.get("has_theme", False)
-    }
-
-
-class SavePosterReq(BaseModel):
-    item_id: str
-    save_to_dir: bool = True
-    embed_in_theme: bool = True
-
-@app.post("/api/poster-save")
-def api_poster_save(data: SavePosterReq):
-    state = load_state()
-    cfg = load_config()
-    item = state["items"].get(data.item_id)
-    if not item:
-        return {"ok": False, "msg": "Eintrag nicht gefunden"}
-
-    target_dir = Path(item.get("dir", ""))
-    if not target_dir.exists():
-        return {"ok": False, "msg": f"Verzeichnis {target_dir} nicht gefunden"}
-
-    poster_file = target_dir / "poster.jpg"
-    poster_bytes = None
-
-    if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
-        headers = get_jellyfin_headers(cfg.get("jellyfin_api_key", ""))
-        try:
-            r = requests.get(f"{cfg['jellyfin_url']}/Items/{item['jf_raw_id']}/Images/Primary", headers=headers, timeout=8)
-            if r.status_code == 200 and len(r.content) > 1024:
-                poster_bytes = r.content
-        except Exception:
-            pass
-
-    if not poster_bytes and poster_file.exists():
-        poster_bytes = poster_file.read_bytes()
-
-    if not poster_bytes:
-        return {"ok": False, "msg": "Kein Poster in Jellyfin oder lokal verfügbar"}
-
-    if data.save_to_dir:
-        try:
-            poster_file.write_bytes(poster_bytes)
-        except Exception as e:
-            return {"ok": False, "msg": f"Fehler beim Speichern von poster.jpg: {e}"}
-
-    if data.embed_in_theme and (target_dir / "theme.mp3").exists():
-        try:
-            mp3_path = target_dir / "theme.mp3"
-            post_process_audio(mp3_path, mp3_path, duration=180, fade=False, cover_path=poster_file)
-        except Exception:
-            pass
-
-    return {"ok": True, "msg": "Poster erfolgreich als poster.jpg gespeichert und in theme.mp3 eingebettet!"}
 
 
 class TestJellyfinReq(BaseModel):
@@ -1615,10 +1453,6 @@ def get_settings_page():
                         <input type="checkbox" id="audio_fade" name="audio_fade" {'checked' if cfg.get('audio_fade', True) else ''}>
                         <label for="audio_fade"><strong>Sanftes Ein- und Ausblenden (Fade-In / Fade-Out):</strong> 1.5s sanft anblenden, 3s ausblenden</label>
                     </div>
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="embed_cover" name="embed_cover" {'checked' if cfg.get('embed_cover', True) else ''}>
-                        <label for="embed_cover"><strong>Cover-Bild direkt in MP3 einbetten (ID3-Tag) & poster.jpg speichern</strong></label>
-                    </div>
                 </div>
             </div>
 
@@ -1716,7 +1550,6 @@ def update_settings(
     min_duration_sec: int = Form(25),
     max_duration_sec: int = Form(270),
     audio_fade: Optional[str] = Form(None),
-    embed_cover: Optional[str] = Form(None),
     scan_interval_hours: int = Form(12)
 ):
     cfg = load_config()
@@ -1729,7 +1562,6 @@ def update_settings(
     cfg["min_duration_sec"] = min_duration_sec
     cfg["max_duration_sec"] = max_duration_sec
     cfg["audio_fade"] = bool(audio_fade)
-    cfg["embed_cover"] = bool(embed_cover)
     cfg["scan_interval_hours"] = scan_interval_hours
 
     save_config(cfg)
@@ -1811,14 +1643,9 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             else:
                 sub_info = ""
 
-        p_dir = Path(it.get("dir", ""))
-        has_local_poster = (p_dir / "poster.jpg").exists() or (p_dir / "folder.jpg").exists()
-        poster_btn_label = "🖼️ Poster ✓" if has_local_poster else "🖼️ Poster"
-        poster_btn_class = "btn-sm success" if has_local_poster else "btn-sm secondary"
-
         rows += f"""
         <tr id="row_{iid}">
-            <td style="width: 50px; padding: 6px; cursor: pointer;" onclick="openPosterModal('{iid}')" title="Klicken für tMM Poster-Vorschau">
+            <td style="width: 50px; padding: 6px;">
                 <img src="/poster/{iid}" style="width: 44px; height: 64px; object-fit: cover; border-radius: 4px; display: block;" loading="lazy" alt="Cover">
             </td>
             <td>
@@ -1847,8 +1674,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         <input type="hidden" name="q" value="{q}">
                         <button type="submit" class="btn-sm secondary" title="Nur diesen Eintrag neu prüfen">🔄</button>
                     </form>
-                    <button type="button" class="{poster_btn_class}" title="tMM Poster-Vorschau & Download" onclick="openPosterModal('{iid}')">{poster_btn_label}</button>
-                    <button type="button" class="btn-sm secondary" title="tMM Renamer: Vorschau & Umbenennen" onclick="openRenameModal('{iid}')">🏷️</button>
                     <form method="post" action="/delete/{iid}" style="display:inline;" onsubmit="return confirm('Theme löschen und sperren?');">
                         <input type="hidden" name="tab" value="{clean_tab}">
                         <input type="hidden" name="filter_status" value="{filter_status}">
@@ -1880,7 +1705,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Theme Fetcher & Media Manager (tMM)</title>
+        <title>Theme Fetcher</title>
         <style>
             :root {{
                 --bg: #121417;
@@ -1920,42 +1745,35 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; display:inline-block; }}
             .badge.ok {{ background: var(--success-bg); color: var(--success-text); }}
             .badge.miss {{ background: var(--miss-bg); color: var(--miss-text); }}
-            .badge.active-dl {{ background: #1c3b66; color: #7db2ff; animation: pulse 1.2s infinite; }}
-            @keyframes pulse {{ 0% {{ opacity: 0.6; }} 50% {{ opacity: 1; }} 100% {{ opacity: 0.6; }} }}
             .inline-form {{ display: inline-flex; gap: 4px; }}
             audio {{ height: 32px; width: 190px; }}
             .banner {{ background: #1d4d32; color: #5ce69a; padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }}
             
+            /* PROGRESS & QUEUE CARD */
             .progress-card {{ background: var(--card-bg); border: 1px solid #344256; border-radius: 8px; padding: 16px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
             .progress-bar-bg {{ background: #262a32; height: 14px; border-radius: 7px; overflow: hidden; margin: 10px 0; }}
             .progress-bar-fill {{ background: #28a745; height: 100%; width: 0%; transition: width 0.3s ease; }}
             .queue-box {{ background: #131519; border: 1px solid #232730; border-radius: 6px; padding: 10px; margin-top: 12px; font-size: 0.85rem; }}
             
+            /* TABS */
             .tab-nav {{ display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 8px; flex-wrap: wrap; }}
             .tab-btn {{ background: transparent; color: var(--text-muted); border: 1px solid transparent; padding: 8px 16px; border-radius: 6px; font-size: 0.95rem; cursor: pointer; text-decoration: none; font-weight: 600; }}
             .tab-btn:hover {{ background: #20242b; color: #fff; }}
             .tab-btn.active {{ background: #2b7de9; color: #fff; }}
             
+            /* FILTER PILLS */
             .pill-filter {{ display: flex; gap: 8px; align-items: center; flex-wrap:wrap; }}
             .pill {{ background: #20242b; color: var(--text-muted); border: 1px solid #2d323b; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; text-decoration: none; font-weight: 500; cursor: pointer; }}
             .pill:hover {{ color: #fff; border-color: #3f4552; }}
             .pill.active {{ background: #2b7de9; color: #fff; border-color: #2b7de9; }}
             .pill.miss.active {{ background: #c93b3b; color: #fff; border-color: #c93b3b; }}
             .pill.ok.active {{ background: #28a745; color: #fff; border-color: #28a745; }}
-
-            /* TMM MODAL POPUP STYLES */
-            .modal-backdrop {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.75); display: none; align-items: center; justify-content: center; z-index: 1000; }}
-            .modal {{ background: var(--card-bg); border: 1px solid #343b47; border-radius: 10px; width: 90%; max-width: 650px; padding: 24px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); max-height: 90vh; overflow-y: auto; }}
-            .modal h2 {{ margin-top: 0; font-size: 1.25rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }}
-            .modal-close {{ background: transparent; color: var(--text-muted); border: none; font-size: 1.4rem; cursor: pointer; padding: 0 4px; }}
-            .modal-close:hover {{ color: #fff; }}
-            .compare-box {{ background: #121417; border: 1px solid #2b303c; border-radius: 6px; padding: 12px; margin: 14px 0; font-size: 0.88rem; }}
         </style>
     </head>
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher & Media Manager</h1>
+                <h1>🎵 Theme Fetcher</h1>
                 <div class="stats">Filme: {filme_ok}/{total_filme} • Serien: {serien_ok}/{total_serien} • Collections: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -1966,7 +1784,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <input type="hidden" name="tab" value="{clean_tab}">
                     <input type="hidden" name="filter_status" value="{filter_status}">
                     <input type="hidden" name="q" value="{q}">
-                    <button type="submit" title="Scannt nur die aktuelle Kategorie ({scope_label})">🔍 Nur {scope_label} scannen</button>
+                    <button type="submit" title="Scannt ausschließlich {scope_label}">🔍 Nur {scope_label} scannen</button>
                 </form>
 
                 <form method="post" action="/scan" style="display:inline;">
@@ -2065,76 +1883,8 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </table>
         </div>
 
-        <!-- 1. TMM RENAMER MODAL (VORHER/NACHHER) -->
-        <div id="renameModal" class="modal-backdrop">
-            <div class="modal">
-                <h2>
-                    <span>🏷️ tMM Renamer • Vorschau</span>
-                    <button class="modal-close" onclick="closeModal('renameModal')">&times;</button>
-                </h2>
-                <div id="renameLoading" style="padding:20px; text-align:center; color:var(--text-muted);">Lade Vorschau...</div>
-                <div id="renameContent" style="display:none;">
-                    <p style="margin-top:0; color:var(--text-muted); font-size:0.9rem;">
-                        Folgende Änderungen werden nach Jellyfin/Plex-Standard vorgenommen:
-                    </p>
-
-                    <div class="compare-box">
-                        <strong style="color:#7db2ff;">📁 Ordner-Umbenennung:</strong><br>
-                        <div style="margin-top:4px;">
-                            <span style="color:#ff8585;">Ist:</span> <code id="ren_old_dir"></code><br>
-                            <span style="color:#5ce69a;">Soll:</span> <code id="ren_new_dir"></code>
-                        </div>
-                    </div>
-
-                    <div class="compare-box">
-                        <strong style="color:#7db2ff;">🎬 Videodatei(en):</strong>
-                        <div id="ren_files_list" style="margin-top:6px; line-height:1.6;"></div>
-                    </div>
-
-                    <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:20px;">
-                        <button type="button" class="secondary" onclick="closeModal('renameModal')">Abbrechen</button>
-                        <button type="button" id="btnExecuteRename" class="success" onclick="executeRename()">✓ Jetzt umbenennen</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 2. TMM POSTER MODAL (ARTWORK VORSCHAU & SPEICHERN) -->
-        <div id="posterModal" class="modal-backdrop">
-            <div class="modal" style="max-width:500px;">
-                <h2>
-                    <span id="posterModalTitle">🖼️ Poster auswählen</span>
-                    <button class="modal-close" onclick="closeModal('posterModal')">&times;</button>
-                </h2>
-                <div id="posterLoading" style="padding:20px; text-align:center; color:var(--text-muted);">Lade Artwork...</div>
-                <div id="posterContent" style="display:none; text-align:center;">
-                    <div style="margin: 10px auto; max-width:240px; box-shadow: 0 4px 14px rgba(0,0,0,0.5); border-radius:6px; overflow:hidden;">
-                        <img id="posterModalImg" src="" style="width:100%; height:auto; display:block;" alt="Poster">
-                    </div>
-                    <div id="posterLocalNotice" style="font-size:0.8rem; margin:8px 0; color:var(--text-muted);"></div>
-                    
-                    <div style="text-align:left; background:#121417; border:1px solid #2b303c; border-radius:6px; padding:12px; margin:16px 0; font-size:0.85rem;">
-                        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; cursor:pointer;">
-                            <input type="checkbox" id="chk_save_dir" checked>
-                            <span>Als <code>poster.jpg</code> direkt im Medienordner ablegen</span>
-                        </label>
-                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-                            <input type="checkbox" id="chk_embed_theme" checked>
-                            <span>Als Coverbild fest in die <code>theme.mp3</code> einbetten</span>
-                        </label>
-                    </div>
-
-                    <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px;">
-                        <button type="button" class="secondary" onclick="closeModal('posterModal')">Schließen</button>
-                        <button type="button" id="btnSavePoster" class="success" onclick="savePosterAction()">💾 Poster speichern</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
         <script>
-            let currentItemId = null;
-
+            // Audio-Autostopp: Sobald ein Player startet, pausieren alle anderen
             document.addEventListener('play', function(e){{
                 var audios = document.getElementsByTagName('audio');
                 for(var i = 0, len = audios.length; i < len; i++){{
@@ -2143,129 +1893,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     }}
                 }}
             }}, true);
-
-            function closeModal(id) {{
-                document.getElementById(id).style.display = 'none';
-            }}
-
-            async function openRenameModal(itemId) {{
-                currentItemId = itemId;
-                const modal = document.getElementById('renameModal');
-                const loading = document.getElementById('renameLoading');
-                const content = document.getElementById('renameContent');
-
-                modal.style.display = 'flex';
-                loading.style.display = 'block';
-                content.style.display = 'none';
-
-                try {{
-                    const resp = await fetch('/api/rename-preview/' + itemId);
-                    const data = await resp.json();
-                    if (!data.ok) {{
-                        alert(data.msg);
-                        closeModal('renameModal');
-                        return;
-                    }}
-
-                    document.getElementById('ren_old_dir').innerText = data.current_dir;
-                    document.getElementById('ren_new_dir').innerText = data.new_dir;
-                    
-                    const filesDiv = document.getElementById('ren_files_list');
-                    if (data.files && data.files.length > 0) {{
-                        filesDiv.innerHTML = data.files.map(f => 
-                            '<div><span style=\"color:' + (f.changed ? '#ff8585' : '#7d8590') + '\">' + f.old + '</span> ➔ <span style=\"color:#5ce69a;\"><strong>' + f.new + '</strong></span></div>'
-                        ).join('');
-                    }} else {{
-                        filesDiv.innerText = 'Keine Videodateien im Ordner gefunden.';
-                    }}
-
-                    loading.style.display = 'none';
-                    content.style.display = 'block';
-                }} catch (e) {{
-                    alert('Fehler beim Laden der Vorschau: ' + e);
-                    closeModal('renameModal');
-                }}
-            }}
-
-            async function executeRename() {{
-                const btn = document.getElementById('btnExecuteRename');
-                btn.innerText = '⏳ Benenne um...';
-                try {{
-                    const resp = await fetch('/api/rename-execute', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ item_id: currentItemId }})
-                    }});
-                    const data = await resp.json();
-                    alert(data.msg);
-                    if (data.ok) location.reload();
-                }} catch (e) {{
-                    alert('Fehler: ' + e);
-                    btn.innerText = '✓ Jetzt umbenennen';
-                }}
-            }}
-
-            async function openPosterModal(itemId) {{
-                currentItemId = itemId;
-                const modal = document.getElementById('posterModal');
-                const loading = document.getElementById('posterLoading');
-                const content = document.getElementById('posterContent');
-
-                modal.style.display = 'flex';
-                loading.style.display = 'block';
-                content.style.display = 'none';
-
-                try {{
-                    const resp = await fetch('/api/poster-preview/' + itemId);
-                    const data = await resp.json();
-                    if (!data.ok) {{
-                        alert(data.msg);
-                        closeModal('posterModal');
-                        return;
-                    }}
-
-                    document.getElementById('posterModalTitle').innerText = '🖼️ Poster: ' + data.title;
-                    document.getElementById('posterModalImg').src = data.poster_url;
-                    
-                    const note = document.getElementById('posterLocalNotice');
-                    if (data.has_local) {{
-                        note.innerHTML = '<span style=\"color:#5ce69a;\">✓ Lokales Poster vorhanden (' + data.local_name + ')</span>';
-                    }} else {{
-                        note.innerHTML = '<span style=\"color:#ff8585;\">✕ Bisher kein poster.jpg auf der Festplatte gespeichert</span>';
-                    }}
-
-                    loading.style.display = 'none';
-                    content.style.display = 'block';
-                }} catch (e) {{
-                    alert('Fehler beim Laden des Posters: ' + e);
-                    closeModal('posterModal');
-                }}
-            }}
-
-            async function savePosterAction() {{
-                const btn = document.getElementById('btnSavePoster');
-                btn.innerText = '⏳ Speichere...';
-                const saveDir = document.getElementById('chk_save_dir').checked;
-                const embedTheme = document.getElementById('chk_embed_theme').checked;
-
-                try {{
-                    const resp = await fetch('/api/poster-save', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{
-                            item_id: currentItemId,
-                            save_to_dir: saveDir,
-                            embed_in_theme: embedTheme
-                        }})
-                    }});
-                    const data = await resp.json();
-                    alert(data.msg);
-                    if (data.ok) location.reload();
-                }} catch (e) {{
-                    alert('Fehler: ' + e);
-                    btn.innerText = '💾 Poster speichern';
-                }}
-            }}
 
             async function cancelRunningAction() {{
                 try {{
@@ -2292,6 +1919,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         document.getElementById('progDown').innerText = data.new_downloaded;
                         document.getElementById('progFail').innerText = data.failed;
 
+                        // Tabellen-Fortschrittsbalken pro Zeile
                         if (data.current_item_id) {{
                             const barBox = document.getElementById('prog_bar_box_' + data.current_item_id);
                             const barFill = document.getElementById('prog_bar_fill_' + data.current_item_id);
