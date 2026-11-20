@@ -11,10 +11,7 @@ from typing import List, Optional, Tuple, Dict
 from fastapi import FastAPI, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from pydantic import BaseModel
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
+from PIL import Image
 
 app = FastAPI(title="Theme Fetcher")
 
@@ -419,15 +416,14 @@ def find_local_cover_image(d: Path, title: str = "") -> Optional[Path]:
         if title_slug and title_slug in slugify(fname):
             return f
 
-    # 2. Metadaten-Check: Plakate sind Hochformat (Höhe > Breite)
+    # 2. Metadaten-Check mit Pillow: Plakate sind Hochformat (Höhe > Breite)
     portraits = []
     for f in candidates:
         try:
-            if Image:
-                with Image.open(f) as img:
-                    w, h = img.size
-                    if h > w and (h / max(1, w)) >= 1.15:
-                        portraits.append((h / w, f))
+            with Image.open(f) as img:
+                w, h = img.size
+                if h > w and (h / max(1, w)) >= 1.15:
+                    portraits.append((h / w, f))
         except Exception:
             pass
 
@@ -496,7 +492,7 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="1.9.0"',
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.0.0"',
         "Accept": "application/json"
     }
 
@@ -1884,7 +1880,7 @@ def get_settings_page():
         <div class="nav-back">
             <a href="/">{get_t(cfg, "back_to_lib")}</a>
         </div>
-        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v19</span></h1>
+        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v20</span></h1>
 
         <form method="post" action="/settings">
             <div class="card">
@@ -2133,6 +2129,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     items.sort(key=lambda x: (x.get("has_theme", False), x.get("title", "").lower()))
     st_cache = state.get("soundtrack_cache", {})
 
+    del_confirm_msg = get_t(cfg, "btn_delete_confirm")
     rows = ""
     for it in items:
         iid = it["id"]
@@ -2175,7 +2172,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
             </td>
             <td>
                 <strong>{it['title']}</strong>{orig_hint} <small>({it.get('year') or '-'})</small><br>
-                <span class="meta">{it['source']} • <code>{it.get('dir')}</code></span>
+                <span class="meta">{it.get('source', 'Local')} • <code>{it.get('dir') or it.get('path', '')}</code></span>
                 {st_hint}
             </td>
             <td>
@@ -2308,7 +2305,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v19</span></h1>
+                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v20</span></h1>
                 <div class="stats">{get_t(cfg, "movies")}: {filme_ok}/{total_filme} • {get_t(cfg, "shows")}: {serien_ok}/{total_serien} • {get_t(cfg, "collections")}: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
