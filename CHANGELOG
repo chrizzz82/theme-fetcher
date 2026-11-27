@@ -1,0 +1,55 @@
+# Changelog
+
+All notable changes to **Theme Fetcher** will be documented in this file.
+
+The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [2.5.0] - 2026-11-24
+
+### 🚀 Highlights & Major Improvements
+- **Strict Series Root-Folder Scanner:** Reworked recursive folder scanner to strictly identify television show roots. Ignores individual episode files (`.mkv`, `.mp4`), season folders (`Staffel 1`, `Season 02`), and disc subdirectories.
+- **Image & Fanart Exclusion:** Prevents directories containing only images (`poster.jpg`, `fanart.jpg`, `extrafanart/`) or metadata from registering as standalone media entries.
+- **Clean Production Codebase:** Streamlined server architecture and removed deprecated debug hooks for enhanced container performance.
+
+### 🐛 Fixed
+- Fixed duplicated entries for television series caused by recursive filesystem traversing.
+- Resolved Jellyfin type mapping to strictly accept `Movie`, `Series`, and `BoxSet`.
+
+---
+
+## [2.4.0] - 2026-11-21
+
+### ✨ Added
+- **Integrated Web Audio Player:** In-browser audio streaming directly from search results with real-time scrub/seek slider, play/pause toggles, and track duration counters.
+- **Mid-Track Seek (`⏩ Mid`):** Instant jump button (50% track duration) to quickly check whether a candidate contains the actual theme hook or dialogue intro.
+- **Soundtrack Identification Engine:** Cross-references media titles against MusicBrainz and Wikidata to detect official scores and composers before executing audio queries.
+- **HTML Badge Status Fix:** Rendered status badges natively (`✓ Present` in emerald green, `✕ Missing` in red) replacing legacy raw strings.
+
+---
+
+## [2.3.0] - 2026-11-20
+
+### ✨ Added
+- **Bilingual Interface:** Full dynamic language toggle between German (🇩🇪 DE) and English (🇬🇧 EN) across all UI elements, settings, and status messages.
+- **Dark Mode UI Overhaul:** Rebuilt frontend layout with slate/graphite theme (`#121417`), responsive grid layouts, and modal windows.
+- **Real-Time Row Progress Indicators:** Individual progress bars per row displaying active steps (`Searching`, `Downloading`, `Mastering`).
+
+---
+
+## [2.0.0] - 2026-11-18
+
+### ✨ Added
+- **Plex Media Server Integration:** Full support for Plex libraries, authentication tokens (`X-Plex-Token`), and collection synchronization.
+- **Multi-Disk Path Resolver:** Automatic cross-mount translation between host paths and container mount points (`/media`, multi-disk UUID paths).
+- **Audio Mastering Pipeline:** Automated ffmpeg audio normalizer applying 1.5s fade-in and 3.0s fade-out curves for seamless background playback in media centers.
+
+---
+
+## [1.0.0] - 2026-11-15
+
+### 🌟 Initial Release
+- **Jellyfin API Support:** Automated library fetching for movies, series, and box sets via Jellyfin REST API.
+- **Audio Retrieval:** Autonomous soundtrack search and extraction using `yt-dlp` and `ffmpeg`.
+- **Dockerized Architecture:** Containerized deployment with persistent state, configuration management, and web dashboard on port `8080`.
