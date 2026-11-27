@@ -60,7 +60,6 @@ EXCLUDE_KEYWORDS = [
 
 THEME_REGEX = re.compile(r".*themes?.*\.(mp3|m4a|flac|ogg|wav|aac|opus)$", re.IGNORECASE)
 
-# Multi-Language Dictionary
 LANG_PACK = {
     "de": {
         "app_title": "Theme Fetcher",
@@ -311,7 +310,7 @@ scan_progress = {
     "current_step": "Ready",
     "current_item_id": "",
     "current_item_title": "",
-    "item_status": {},  # item_id -> {"status": str, "percent": int, "step": str}
+    "item_status": {},
     "processed": 0,
     "total": 0,
     "percent": 0,
@@ -378,7 +377,6 @@ def normalize_tab(tab_name: str) -> str:
 
 
 def find_theme_file_in_dir(d: Path) -> Optional[Path]:
-    """Findet tolerant jede Theme-Audiodatei im Ordner oder in Staffel-Unterordnern"""
     if not d.exists() or not d.is_dir():
         return None
     try:
@@ -396,10 +394,8 @@ def find_theme_file_in_dir(d: Path) -> Optional[Path]:
 
 
 def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> Optional[Path]:
-    """Tolerante Cover-Erkennung: Prüft Verzeichnis, Dateinamen des Films und typische Plakat-Muster"""
     img_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
-    # Prüfe zuerst direkt neben der Videodatei (z. B. Inception-poster.jpg oder Inception.jpg)
     if raw_path_str:
         try:
             rp = Path(raw_path_str)
@@ -430,7 +426,6 @@ def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> 
 
     title_slug = slugify(title) if title else ""
 
-    # 1. Bevorzuge typische Plakat-Namen (Kodi, Plex, Jellyfin Standard)
     for f in candidates:
         fname = f.stem.lower()
         if fname in ("poster", "folder", "cover", "front", "default", "show", "movie"):
@@ -440,7 +435,6 @@ def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> 
         if title_slug and title_slug in slugify(fname):
             return f
 
-    # 2. Metadaten-Check: Plakate sind Hochformat (Höhe > Breite)
     portraits = []
     if Image is not None:
         for f in candidates:
@@ -456,7 +450,6 @@ def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> 
         portraits.sort(key=lambda x: abs(x[0] - 1.48))
         return portraits[0][1]
 
-    # 3. Fallback: Erstes Bild, das kein backdrop / fanart im Namen hat
     for f in candidates:
         fname = f.stem.lower()
         if not any(x in fname for x in ("backdrop", "fanart", "thumb", "banner", "logo", "clearart", "art", "landscape")):
@@ -466,7 +459,6 @@ def find_local_cover_image(d: Path, title: str = "", raw_path_str: str = "") -> 
 
 
 def resolve_media_path(raw_path_str: str) -> Path:
-    """Multi-disk path mapping: Resolves media paths across container mounts"""
     raw_str = raw_path_str.replace("\\", "/")
     p = Path(raw_str)
     if p.exists():
@@ -516,13 +508,12 @@ def get_jellyfin_headers(api_key: str) -> dict:
     return {
         "X-Emby-Token": clean_key,
         "X-MediaBrowser-Token": clean_key,
-        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.4.0"',
+        "Authorization": f'MediaBrowser Token="{clean_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.5.0"',
         "Accept": "application/json"
     }
 
 
 def check_jellyfin_has_theme(jf_url: str, api_key: str, jf_raw_id: str) -> Tuple[bool, str]:
-    """Fragt Jellyfin direkt über die API, ob bereits ein ThemeSong hinterlegt ist"""
     if not jf_url or not api_key or not jf_raw_id:
         return False, ""
     headers = get_jellyfin_headers(api_key)
@@ -546,13 +537,11 @@ def check_jellyfin_has_theme(jf_url: str, api_key: str, jf_raw_id: str) -> Tuple
 
 
 
-"""Soundtrack-Spuerhund Integration"""
 import re
 import requests
 
 def discover_soundtrack(title: str, orig: str = "", tmdb_id: str = "") -> dict:
     info = {"title": "", "composer": "", "source": "", "display": "", "direct_url": ""}
-    # MusicBrainz
     clean = re.sub(r"[^\w\s]", "", orig or title).strip()
     headers = {"User-Agent": "ThemeFetcher/1.6.0"}
     try:
@@ -573,7 +562,6 @@ def discover_soundtrack(title: str, orig: str = "", tmdb_id: str = "") -> dict:
     except Exception:
         pass
 
-    # Wikidata
     try:
         w_url = "https://www.wikidata.org/w/api.php"
         wp = {"action": "wbsearchentities", "search": clean, "language": "de", "format": "json", "limit": "3"}
@@ -621,7 +609,6 @@ def discover_soundtrack_info(item: dict) -> dict:
     return info
 
 def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[dict] = None) -> Tuple[bool, str, Optional[Path]]:
-    """Tiefensuche: Prüft Festplatten & Jellyfin-API auf vorhandene theme.mp3"""
     existing = existing or {}
     candidates = []
 
@@ -662,7 +649,6 @@ def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[di
             it["dir"] = d_str
             return True, d_str, theme_file
 
-    # Recursive search in /media mount for matching folder name
     title_raw = it.get("title", "").strip().lower()
     title_slug = slugify(title_raw)
     media_base = Path("/media")
@@ -684,7 +670,6 @@ def check_item_theme(it: dict, existing: Optional[dict] = None, cfg: Optional[di
         except Exception:
             pass
 
-    # Doppelter Boden: Prüfe direkt über Jellyfin API
     if cfg and it.get("source") == "Jellyfin" and it.get("jf_raw_id") and cfg.get("jellyfin_url"):
         has_jf_theme, t_name = check_jellyfin_has_theme(cfg["jellyfin_url"], cfg.get("jellyfin_api_key", ""), it["jf_raw_id"])
         if has_jf_theme:
@@ -722,6 +707,13 @@ def sync_collection_theme(item: dict, mp3_path: Path, jf_meta_base: str):
             print(f"[Collection Sync Warnung] {e}")
 
 
+def is_season_or_disc_dir(name: str) -> bool:
+    return bool(re.search(r"^(season|staffel|specials|\bs\d+|\bst\d+|cd\d+|disc\d+|folge\b|episodes?\b)", name.strip(), re.IGNORECASE))
+
+def is_series_parent_dir(p: Path) -> bool:
+    parts = [part.lower() for part in p.parts]
+    return any(x in parts for x in ("serien", "series", "tv", "shows", "tv shows", "tv-shows", "tv-serien"))
+
 def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclude_slugs: set = None) -> tuple[List[dict], List[str]]:
     results = []
     scanned_dirs = []
@@ -731,6 +723,11 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
     exclude_slugs = exclude_slugs or set()
     paths = [p.strip() for p in paths_str.replace(";", ",").split(",") if p.strip()]
     video_exts = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".iso"}
+    ignore_folder_names = {
+        "@eadir", "$recycle.bin", "system volume information",
+        "extrafanart", "extra fanart", "sample", "samples", "trailers",
+        "subs", "subtitles", ".actors", "featurettes", "behind the scenes"
+    }
 
     for base_str in paths:
         base = Path(base_str)
@@ -746,53 +743,113 @@ def scan_local_folders(paths_str: str, filter_type: Optional[str] = None, exclud
                     break
 
                 rpath = Path(root)
-                if rpath.name.startswith(".") or rpath.name.lower() in ("@eadir", "$recycle.bin", "system volume information"):
+                rname_lower = rpath.name.lower()
+
+                if rpath.name.startswith(".") or rname_lower in ignore_folder_names:
+                    dirs.clear()
                     continue
 
-                try:
-                    rel_parts = rpath.relative_to(base).parts
-                except ValueError:
-                    rel_parts = ()
-                if len(rel_parts) > 3:
+                if is_season_or_disc_dir(rpath.name):
+                    dirs.clear()
                     continue
 
-                has_video = any(Path(f).suffix.lower() in video_exts for f in files)
+                if rpath == base or (rpath.parent == base and rname_lower in ("serien", "series", "tv", "shows", "tv shows", "filme", "movies", "film", "bilder", "photos")):
+                    if rname_lower in ("filme", "movies", "film"):
+                        video_files = [f for f in files if Path(f).suffix.lower() in video_exts]
+                        for vf in video_files:
+                            stem = Path(vf).stem
+                            m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", stem)
+                            title = m.group(1).strip() if m else re.sub(r"[\._]", " ", stem).strip()
+                            year = m.group(2) if m else None
+                            
+                            if filter_type and filter_type != "Film":
+                                continue
+                            
+                            item_slug = f"{slugify(title)}_{year or ''}"
+                            alt_slug = slugify(title)
+                            vfile_path = str(rpath / vf)
+                            if item_slug in exclude_slugs or alt_slug in exclude_slugs or vfile_path in exclude_slugs:
+                                continue
+                            
+                            results.append({
+                                "id": f"local_{abs(hash(vfile_path))}",
+                                "source": "Lokal",
+                                "type": "Film",
+                                "title": title,
+                                "original_title": "",
+                                "year": year,
+                                "dir": str(rpath),
+                                "raw_path": vfile_path
+                            })
+                    continue
+
+                video_files = [f for f in files if Path(f).suffix.lower() in video_exts]
+                has_seasons = any(is_season_or_disc_dir(d) for d in dirs)
                 has_theme = bool(find_theme_file_in_dir(rpath))
-                has_seasons = any(re.search(r"season|staffel|specials", d, re.IGNORECASE) for d in dirs)
+                
+                is_series = is_series_parent_dir(rpath) or has_seasons or any(
+                    re.search(r"[sS]\d{1,2}[eE]\d{1,2}|\b\d{1,2}x\d{2}\b|staffel", f, re.IGNORECASE)
+                    for f in video_files
+                )
 
-                if has_video or has_theme or has_seasons:
-                    if re.search(r"^(season|staffel|specials|\bs\d+)", rpath.name, re.IGNORECASE):
+                if is_series:
+                    if has_seasons or video_files or has_theme:
+                        if filter_type and filter_type != "Serie":
+                            dirs.clear()
+                            continue
+                        
+                        m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", rpath.name)
+                        title = m.group(1).strip() if m else re.sub(r"[\._]", " ", rpath.name).strip()
+                        year = m.group(2) if m else None
+
+                        item_slug = f"{slugify(title)}_{year or ''}"
+                        alt_slug = slugify(title)
+                        if item_slug in exclude_slugs or alt_slug in exclude_slugs or str(rpath) in exclude_slugs:
+                            dirs.clear()
+                            continue
+
+                        results.append({
+                            "id": f"local_{abs(hash(str(rpath)))}",
+                            "source": "Lokal",
+                            "type": "Serie",
+                            "title": title,
+                            "original_title": "",
+                            "year": year,
+                            "dir": str(rpath)
+                        })
+                    dirs.clear()
+                    continue
+
+                if video_files or has_theme:
+                    if filter_type and filter_type != "Film":
+                        dirs.clear()
                         continue
 
-                    name = rpath.name
-                    year = None
-                    m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", name)
-                    if m:
-                        title = m.group(1).strip()
-                        year = m.group(2)
-                    else:
-                        title = re.sub(r"[\._]", " ", name).strip()
-
-                    itype = "Serie" if has_seasons or any("s01" in f.lower() or "staffel" in f.lower() for f in files) else "Film"
-                    if filter_type and itype != filter_type:
-                        continue
+                    m = re.search(r"^(.*?)\s*[\(\[](\d{4})[\)\]]", rpath.name)
+                    title = m.group(1).strip() if m else re.sub(r"[\._]", " ", rpath.name).strip()
+                    year = m.group(2) if m else None
 
                     item_slug = f"{slugify(title)}_{year or ''}"
                     alt_slug = slugify(title)
                     if item_slug in exclude_slugs or alt_slug in exclude_slugs or str(rpath) in exclude_slugs:
+                        dirs.clear()
                         continue
 
-                    item_id = f"local_{abs(hash(str(rpath)))}"
-
                     results.append({
-                        "id": item_id,
+                        "id": f"local_{abs(hash(str(rpath)))}",
                         "source": "Lokal",
-                        "type": itype,
+                        "type": "Film",
                         "title": title,
                         "original_title": "",
                         "year": year,
                         "dir": str(rpath)
                     })
+                    dirs.clear()
+                    continue
+
+                if not any(Path(f).suffix.lower() in video_exts for f in files) and not dirs:
+                    dirs.clear()
+
         except Exception as e:
             print(f"[Lokaler Scan Fehler bei {base_str}] {e}")
 
@@ -924,6 +981,8 @@ def fetch_jellyfin_items(url: str, api_key: str, filter_type: Optional[str] = No
 
         for item in resp.json().get("Items", []):
             item_type = item.get("Type")
+            if item_type not in ("Movie", "Series", "BoxSet"):
+                continue
             title = item.get("Name", "Unbekannt")
             clean_id = item["Id"]
             item_id = f"jf_{clean_id}"
@@ -1304,7 +1363,6 @@ def search_and_download(item: dict, custom_query_or_url: Optional[str] = None, c
 
 
 def run_scan(scope: str = "all"):
-    """Führt entweder einen strikten Einzelkategorie-Scan oder einen globalen Komplett-Scan aus"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -1364,16 +1422,13 @@ def run_scan(scope: str = "all"):
             raw_items.extend(loc_items)
             all_scanned_folders.extend(loc_folders)
 
-        # 1. Sammle neu eingelesene Items
         current_state_items = {}
         for it in raw_items:
             current_state_items[it["id"]] = it
 
-        # 2. DEDUPLIZIERUNG: 1 Film / Serie = 1 Zeile
         unified_items = {}
         source_prio = {"Jellyfin": 3, "Plex": 2, "Lokal": 1}
 
-        # Behalte Items anderer Kategorien unangetastet!
         existing_other = {}
         existing_same = {}
         for k, v in state.get("items", {}).items():
@@ -1400,7 +1455,6 @@ def run_scan(scope: str = "all"):
                 else:
                     unified_items[unique_key] = {**it, **existing}
 
-        # Strikte Filterung: Verarbeite NUR Items der gewählten Rubrik!
         items_to_process = list(unified_items.values())
         if scope != "all":
             items_to_process = [it for it in items_to_process if it.get("type") == scope]
@@ -1444,7 +1498,6 @@ def run_scan(scope: str = "all"):
             }
             existing_same[item_id] = record
 
-        # Speichere die bearbeitete Kategorie zusammen mit den unangetasteten anderen Kategorien ab
         state["items"] = {**existing_other, **existing_same}
 
         if scope == "all":
@@ -1460,7 +1513,6 @@ def run_scan(scope: str = "all"):
 
 
 def run_download_queue(scope: str = "all"):
-    """Lädt fehlende Themes in die Warteschlange – unterstützt Fortschrittsbalken pro Zeile & global"""
     global scan_progress, stop_requested
     if scan_progress["is_running"]:
         return
@@ -1553,28 +1605,24 @@ def run_download_queue(scope: str = "all"):
 
 @app.get("/poster/{item_id}")
 def get_poster(item_id: str):
-    """Liefert das Cover mit lokalem Cache: Erst Jellyfin/Plex-API ohne falsche JSON-Headers, dann Festplatte"""
     state = load_state()
     cfg = load_config()
     item = state["items"].get(item_id)
     if not item:
         raise HTTPException(status_code=404)
 
-    # 0. Schneller lokaler Cache: Verhindert 100 parallele API-Anfragen an Jellyfin!
     cached_cover = POSTERS_DIR / f"{item_id}.jpg"
     if cached_cover.exists() and cached_cover.stat().st_size > 500:
         return FileResponse(cached_cover, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
 
-    # 1. Prio: Jellyfin Image API (WICHTIG: OHNE Accept: application/json, sonst 406 oder kein Bild!)
     if item.get("source") == "Jellyfin" and item.get("jf_raw_id") and cfg.get("jellyfin_url"):
         jf_url = clean_url_input(cfg["jellyfin_url"])
         raw_id = item["jf_raw_id"]
         api_key = cfg.get("jellyfin_api_key", "").strip()
         
-        # Spezielle Header für Binärbilder
         img_headers = {
             "X-Emby-Token": api_key,
-            "Authorization": f'MediaBrowser Token="{api_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.4.0"'
+            "Authorization": f'MediaBrowser Token="{api_key}", Client="ThemeFetcher", Device="MediaServer", DeviceId="theme-fetcher-app", Version="2.5.0"'
         }
 
         for img_type in ("Primary", "Thumb", "Backdrop"):
@@ -1596,7 +1644,6 @@ def get_poster(item_id: str):
             except Exception:
                 pass
 
-    # 2. Prio: Plex Thumbnail
     if item.get("source") == "Plex" and item.get("plex_thumb") and cfg.get("plex_url"):
         plex_url = clean_url_input(cfg["plex_url"])
         token = cfg.get("plex_token", "").strip()
@@ -1612,7 +1659,6 @@ def get_poster(item_id: str):
         except Exception:
             pass
 
-    # 3. Prio: Lokale Festplatten-Erkennung (Hochformat & flexible Dateinamen)
     p = Path(item.get("dir", ""))
     cover_file = find_local_cover_image(p, title=item.get("title", ""), raw_path_str=item.get("raw_path", ""))
     if cover_file and cover_file.exists():
@@ -1622,7 +1668,6 @@ def get_poster(item_id: str):
             pass
         return FileResponse(cover_file, headers={"Cache-Control": "public, max-age=604800"})
 
-    # 4. Fallback: Saubere SVG-Initialen
     initial = (item.get("title") or "?")[0].upper()
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="90" viewBox="0 0 60 90">
         <rect width="100%" height="100%" fill="#262a32" rx="4"/>
@@ -1647,7 +1692,6 @@ def stream_audio(item_id: str):
 
 @app.get("/api/candidate-stream")
 def candidate_stream(v: str):
-    """Extrahiert direkte Audio-Stream-URL via yt-dlp für schnelles Vorhören ohne Download"""
     target = f"https://www.youtube.com/watch?v={v}" if not v.startswith("http") else v
     try:
         cmd = ["yt-dlp", "-g", "-f", "ba[ext=m4a]/ba/b", target]
@@ -1662,7 +1706,6 @@ def candidate_stream(v: str):
 
 @app.get("/api/theme-candidates/{item_id}")
 def api_theme_candidates(item_id: str, q: Optional[str] = None):
-    """Liefert die Top 5-8 Theme-Vorschläge inklusive Spürhund-Metadaten für das Auswahl-Modal"""
     state = load_state()
     cfg = load_config()
     item = state["items"].get(item_id)
@@ -1938,7 +1981,7 @@ def get_settings_page():
         <div class="nav-back">
             <a href="/">{get_t(cfg, "back_to_lib")}</a>
         </div>
-        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v24</span></h1>
+        <h1>⚙️ {get_t(cfg, "settings_title")} <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v25</span></h1>
 
         <form method="post" action="/settings">
             <div class="card">
@@ -2365,7 +2408,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
     <body>
         <div class="header">
             <div>
-                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v24</span></h1>
+                <h1>🎵 Theme Fetcher <span style="font-size:0.75rem; background:#2b7de9; color:#fff; padding:2px 8px; border-radius:12px; vertical-align:middle; font-weight:600;">v25</span></h1>
                 <div class="stats">{get_t(cfg, "movies")}: {filme_ok}/{total_filme} • {get_t(cfg, "shows")}: {serien_ok}/{total_serien} • {get_t(cfg, "collections")}: {cols_ok}/{total_cols}</div>
             </div>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -2483,7 +2526,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     <button class="modal-close" onclick="closeModal('themeModal')">&times;</button>
                 </h2>
                 
-                <div id="themeSpuerhundBanner" style="display:none; background:#192636; border:1px solid #2b4566; color:#7db2ff; padding:8px 12px; border-radius:6px; margin: 10px 0; font-size:0.85rem;"></div>
+                <div id="soundtrackBanner" style="display:none; background:#192636; border:1px solid #2b4566; color:#7db2ff; padding:8px 12px; border-radius:6px; margin: 10px 0; font-size:0.85rem;"></div>
 
                 <div style="display:flex; gap:6px; margin: 12px 0 16px 0;">
                     <input type="text" id="themeSearchInput" placeholder="{get_t(cfg, 'modal_search_placeholder')}" style="flex:1;">
@@ -2501,9 +2544,8 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
         <script>
             let currentModalItemId = null;
 
-            // Audio-Autostopp & 50% Standard-Lautstärke
             document.addEventListener('play', function(e){{
-                e.target.volume = 0.5; // Angenehme Standard-Lautstärke
+                e.target.volume = 0.5;
                 var audios = document.getElementsByTagName('audio');
                 for(var i = 0, len = audios.length; i < len; i++){{
                     if(audios[i] != e.target){{
@@ -2626,7 +2668,7 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                     loading.style.display = 'none';
                     list.style.display = 'block';
 
-                    const banner = document.getElementById('themeSpuerhundBanner');
+                    const banner = document.getElementById('soundtrackBanner');
                     if (data.soundtrack_info && data.soundtrack_info.display) {{
                         banner.style.display = 'block';
                         banner.innerHTML = '🎯 <strong>Erkannter Soundtrack:</strong> ' + data.soundtrack_info.display + ' <span style="color:#8b929a;">(Quelle: ' + data.soundtrack_info.source + ')</span>';
@@ -2744,7 +2786,6 @@ def index(q: str = "", filter_status: str = "all", tab: str = "filme", settings:
                         document.getElementById('progDown').innerText = data.new_downloaded;
                         document.getElementById('progFail').innerText = data.failed;
 
-                        // Tabellen-Fortschrittsbalken pro Zeile
                         if (data.current_item_id) {{
                             const barBox = document.getElementById('prog_bar_box_' + data.current_item_id);
                             const barFill = document.getElementById('prog_bar_fill_' + data.current_item_id);
