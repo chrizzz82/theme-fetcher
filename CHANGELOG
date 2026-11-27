@@ -2,11 +2,9 @@
 
 All notable changes to **Theme Fetcher** will be documented in this file.
 
-The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ---
 
-## [2.5.0] - 2026-11-24
+## [v25] - 2026-11-24
 
 ### 🚀 Highlights & Major Improvements
 - **Strict Series Root-Folder Scanner:** Reworked recursive folder scanner to strictly identify television show roots. Ignores individual episode files (`.mkv`, `.mp4`), season folders (`Staffel 1`, `Season 02`), and disc subdirectories.
@@ -19,7 +17,7 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [2.4.0] - 2026-11-21
+## [v24] - 2026-11-21
 
 ### ✨ Added
 - **Integrated Web Audio Player:** In-browser audio streaming directly from search results with real-time scrub/seek slider, play/pause toggles, and track duration counters.
@@ -29,7 +27,7 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [2.3.0] - 2026-11-20
+## [v23] - 2026-11-20
 
 ### ✨ Added
 - **Bilingual Interface:** Full dynamic language toggle between German (🇩🇪 DE) and English (🇬🇧 EN) across all UI elements, settings, and status messages.
@@ -38,7 +36,7 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [2.0.0] - 2026-11-18
+## [v20] - 2026-11-18
 
 ### ✨ Added
 - **Plex Media Server Integration:** Full support for Plex libraries, authentication tokens (`X-Plex-Token`), and collection synchronization.
@@ -47,9 +45,9 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [1.0.0] - 2026-11-15
+## [v1.0] - 2026-11-15
 
 ### 🌟 Initial Release
 - **Jellyfin API Support:** Automated library fetching for movies, series, and box sets via Jellyfin REST API.
 - **Audio Retrieval:** Autonomous soundtrack search and extraction using `yt-dlp` and `ffmpeg`.
-- **Dockerized Architecture:** Containerized deployment with persistent state, configuration management, and web dashboard on port `8080`.
+- **Dockerized Architecture:** Containerized deployment with persistent state, configuration management, and web dashboard.
