@@ -1,4 +1,4 @@
-# 🎵 Theme Fetcher
+# 🎵 Theme Fetcher (v25)
 
 > **Autonomous background theme music downloader and web preview manager for Jellyfin, Plex, and local media servers.**
 
@@ -47,7 +47,7 @@ services:
     container_name: theme-fetcher
     restart: unless-stopped
     ports:
-      - "8088:8088"
+      - "8088:8080"
     environment:
       - PUID=1000
       - PGID=100
