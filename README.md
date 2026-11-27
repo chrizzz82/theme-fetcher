@@ -8,7 +8,7 @@
 
 Both **Jellyfin** and **Plex** feature background audio playback while browsing movies, TV shows, and box sets. However, existing plugins often fail on international titles, bundled collections, or pull incorrect audio files without verification.
 
-**Theme Fetcher** is a lightweight, self-hosted Docker companion service that automatically identifies missing theme songs, verifies official scores via **MusicBrainz** and **Wikidata**, allows instant **in-browser streaming previews**, and downloads studio-mastered `theme.mp3` files directly into your media folders.
+**Theme Fetcher** a self-hosted Docker companion service that automatically identifies missing theme songs, verifies official scores via **MusicBrainz** and **Wikidata**, allows instant **in-browser streaming previews**, and downloads studio-mastered `theme.mp3` files directly into your media folders.
 
 ---
 
